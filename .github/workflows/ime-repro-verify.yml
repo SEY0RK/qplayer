@@ -53,6 +53,11 @@ jobs:
       - name: Compile desktop-host IME sources
         run: mvn -B -Dmaven.test.skip=true -pl desktop-host compile
 
+      - name: Compile reproduced feature tests
+        run: |
+          mvn -B -pl player-core compiler:testCompile
+          mvn -B -pl desktop-host compiler:testCompile
+
       - name: Validate all workflow YAML files
         run: |
           python -m pip install --quiet pyyaml
