@@ -78,10 +78,22 @@ public final class QPlayerActivity extends Activity {
     private static final int REQ_PLUGIN_PICK = 5;
     private static final int REQ_FONT_PICK = 6;
     private static final int REQ_AUDIO_SAVE = 7;
+    // 本地改动：歌单导入/导出用 9、10。上游 REQ_AUDIO_SAVE 已占 7，8 留空避让。
+    private static final int REQ_PLAYLIST_IMPORT = 9;
+    private static final int REQ_PLAYLIST_EXPORT = 10;
 
     /** Canonical playlist id awaiting a picked cover image, set right before
      *  launching the gallery picker and consumed in {@link #onActivityResult}. */
     private String pendingCoverPlaylistKey;
+
+    /** 本地改动：歌单导入/导出的中间状态。控制器那侧的桥只说文件系统路径，
+     *  而系统选择器给回的是 content:// Uri，所以两个方向都先把文件暂存在应用私有
+     *  缓存里，这几个字段负责跨 picker 往返传递另一半信息。 */
+    private Consumer<String> pendingPlaylistImportSink;
+    private Consumer<String> pendingPlaylistExportSink;
+    private java.nio.file.Path pendingPlaylistExportStaging;
+    private android.net.Uri pendingPlaylistExportTarget;
+
     private AudioSaveRequest pendingAudioSave;
     private final java.util.Set<AudioSaveRequest> audioSaves =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -148,6 +160,13 @@ public final class QPlayerActivity extends Activity {
                     deleteRecursive(updates);
                     deleteRecursive(dev.t1m3.qplayer.store.AppDirs.cacheDir()
                             .resolve("plugin-imports").toFile());
+                    // 本地改动：暂存的歌单传输文件。没走完的 picker 往返（系统对话框
+                    // 期间 Activity 被重建、用户中途杀进程）会留下私有副本，而暂存副本
+                    // 本来也不是用户要留的那份。
+                    deleteRecursive(dev.t1m3.qplayer.store.AppDirs.cacheDir()
+                            .resolve("playlist-imports").toFile());
+                    deleteRecursive(dev.t1m3.qplayer.store.AppDirs.cacheDir()
+                            .resolve("playlist-exports").toFile());
                     try {
                         dev.t1m3.qplayer.plugin.PluginCompatibility.setHostVersion(
                                 app.getPackageManager().getPackageInfo(app.getPackageName(), 0).versionName);
@@ -258,6 +277,8 @@ public final class QPlayerActivity extends Activity {
         controller.setPluginPicker(this::pickPluginPackage);
         controller.setFileSavePicker(this::saveAudioFile);
         controller.setWebLoginLauncher(this::openWebLogin);
+        // 本地改动：安卓侧的歌单导入/导出（SAF）。
+        controller.setPlaylistFileBridge(new AndroidPlaylistFileBridge());
         webAuthScript = new AndroidWebAuthScript(this);
         controller.setWebAuthScriptLauncher(webAuthScript::run);
 
@@ -781,6 +802,130 @@ public final class QPlayerActivity extends Activity {
         }
     }
 
+    /**
+     * 本地改动：安卓侧的歌单导入/导出。
+     *
+     * <p>{@link PlayerController.PlaylistFileBridge} 只说普通文件系统路径，而
+     * Storage Access Framework 的选择器只会给回 {@code content://} Uri —— 应用私有
+     * 缓存是这台宿主既能写、又能当路径交给控制器的地方，所以两个方向都在那里暂存：
+     *
+     * <ul>
+     *   <li>导入 —— 把选中的文档复制进缓存，把该路径交出去，由控制器解析；</li>
+     *   <li>导出 —— 先交出暂存路径，控制器写完后在 {@link #written} 里把文件发布到
+     *       用户选定的位置。</li>
+     * </ul>
+     */
+    private final class AndroidPlaylistFileBridge implements PlayerController.PlaylistFileBridge {
+
+        @Override
+        public void open(Consumer<String> onPicked) {
+            pendingPlaylistImportSink = onPicked;
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            // 自家文件叫 ".qpl.json"，各家 provider 对它的 MIME 判断不一致：认后缀的
+            // 给 application/json，不认的给 text/plain 或 application/octet-stream。
+            // 过滤太窄会把用户自己的导出文件在那些猜错的文件管理器里直接藏掉，所以
+            // 这里放宽，格式检查放到解析之后。
+            intent.setType("*/*");
+            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                "application/json", "text/plain", "application/octet-stream", "*/*"
+            });
+            try {
+                startActivityForResult(intent, REQ_PLAYLIST_IMPORT);
+            } catch (Throwable error) {
+                pendingPlaylistImportSink = null;
+                dev.t1m3.qplayer.util.Logger.error(
+                        "no document provider to import a playlist: {}", error.toString());
+            }
+        }
+
+        @Override
+        public void save(String suggestedFileName, Consumer<String> onPicked) {
+            java.nio.file.Path staging = newPlaylistStagingPath("playlist-exports");
+            if (staging == null) {
+                showTransferToast(I18n.tr("toast.localPlaylist.exportFailed"));
+                return;
+            }
+            pendingPlaylistExportStaging = staging;
+            pendingPlaylistExportSink = onPicked;
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("application/json");
+            if (suggestedFileName != null && !suggestedFileName.isEmpty()) {
+                // 只是预填文件名；用户仍可改名，某些 provider 遇到不认识的扩展名还会自己再补一个。
+                intent.putExtra(Intent.EXTRA_TITLE, suggestedFileName);
+            }
+            try {
+                startActivityForResult(intent, REQ_PLAYLIST_EXPORT);
+            } catch (Throwable error) {
+                pendingPlaylistExportStaging = null;
+                pendingPlaylistExportSink = null;
+                dev.t1m3.qplayer.util.Logger.error(
+                        "no document provider to export a playlist: {}", error.toString());
+                showTransferToast(I18n.tr("toast.localPlaylist.exportFailed"));
+            }
+        }
+
+        @Override
+        public void written(String path, boolean success) {
+            // 在控制器的 io 线程上执行，永远不在 UI 线程。
+            android.net.Uri target = pendingPlaylistExportTarget;
+            pendingPlaylistExportTarget = null;
+            if (!success || target == null || path == null) return;
+            publishExportedPlaylist(java.nio.file.Paths.get(path), target);
+        }
+    }
+
+    /** 应用私有缓存里的一个全新传输暂存文件；缓存本身不可用时返回 null。 */
+    private java.nio.file.Path newPlaylistStagingPath(String folder) {
+        try {
+            java.nio.file.Path dir = dev.t1m3.qplayer.store.AppDirs.cacheDir().resolve(folder);
+            java.nio.file.Files.createDirectories(dir);
+            return dir.resolve(java.util.UUID.randomUUID().toString() + ".qpl.json");
+        } catch (Throwable error) {
+            dev.t1m3.qplayer.util.Logger.warn(
+                    "playlist staging directory unavailable: {}", error.toString());
+            return null;
+        }
+    }
+
+    /** 把写好的暂存文件复制到用户选定的位置，然后删掉暂存副本。不在 UI 线程上跑。
+     *
+     *  <p>这里失败必须自己报出来：控制器在它那侧写完的那一刻就已经报过导出成功了，
+     *  它看不到 SAF 这一半。 */
+    private void publishExportedPlaylist(java.nio.file.Path staging, android.net.Uri target) {
+        new Thread(() -> {
+            boolean published = false;
+            try (InputStream in = java.nio.file.Files.newInputStream(staging);
+                 java.io.OutputStream out = getContentResolver().openOutputStream(target, "wt")) {
+                if (out != null) {
+                    byte[] buffer = new byte[16 * 1024];
+                    int read;
+                    while ((read = in.read(buffer)) > 0) out.write(buffer, 0, read);
+                    out.flush();
+                    published = true;
+                }
+            } catch (Throwable error) {
+                dev.t1m3.qplayer.util.Logger.warn(
+                        "publishing exported playlist failed: {}", error.toString());
+            } finally {
+                try {
+                    java.nio.file.Files.deleteIfExists(staging);
+                } catch (Throwable ignored) {
+                }
+            }
+            if (!published) {
+                showTransferToast(I18n.tr("toast.localPlaylist.exportFailed"));
+            }
+        }, "qplayer-playlist-export").start();
+    }
+
+    /** 从任意线程弹 toast；传输路径按设计本来就不在 UI 线程上。 */
+    private void showTransferToast(String message) {
+        runOnUiThread(() -> android.widget.Toast.makeText(
+                this, message, android.widget.Toast.LENGTH_SHORT).show());
+    }
+
     private void openWebLogin(String loginUrl, String cookieUrl,
             String credentialCookieName, String providerName) {
         runOnUiThread(() -> {
@@ -867,6 +1012,48 @@ public final class QPlayerActivity extends Activity {
                             "read picked plugin failed: {}", error.toString());
                 }
             }, "qplayer-plugin-pick").start();
+            return;
+        }
+        // 本地改动：歌单导入 —— 选中的文档先复制进私有缓存，控制器只认真实路径。
+        if (requestCode == REQ_PLAYLIST_IMPORT) {
+            Consumer<String> sink = pendingPlaylistImportSink;
+            pendingPlaylistImportSink = null;
+            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null
+                    || sink == null) {
+                return;
+            }
+            final android.net.Uri uri = data.getData();
+            new Thread(() -> {
+                // 控制器在它自己的 io 线程上异步读取并消费这个文件，所以这里不删，
+                // 交给下次启动时的清扫。
+                java.nio.file.Path staging = newPlaylistStagingPath("playlist-imports");
+                if (staging == null) return;
+                try (InputStream in = getContentResolver().openInputStream(uri)) {
+                    if (in == null) return;
+                    java.nio.file.Files.copy(in, staging,
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    sink.accept(staging.toString());
+                } catch (Throwable error) {
+                    dev.t1m3.qplayer.util.Logger.warn(
+                            "read picked playlist failed: {}", error.toString());
+                }
+            }, "qplayer-playlist-import").start();
+            return;
+        }
+        // 本地改动：歌单导出 —— 到现在才让控制器开始写，写进暂存文件；
+        // written() 再把它发布到刚选定的位置。
+        if (requestCode == REQ_PLAYLIST_EXPORT) {
+            Consumer<String> sink = pendingPlaylistExportSink;
+            java.nio.file.Path staging = pendingPlaylistExportStaging;
+            pendingPlaylistExportSink = null;
+            pendingPlaylistExportStaging = null;
+            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null
+                    || sink == null || staging == null) {
+                // 在 picker 上取消：暂存路径没有交到控制器手上，什么都不会写出去。
+                return;
+            }
+            pendingPlaylistExportTarget = data.getData();
+            sink.accept(staging.toString());
             return;
         }
         if (requestCode != REQ_COVER_PICK || resultCode != Activity.RESULT_OK || data == null) return;
@@ -1247,6 +1434,8 @@ public final class QPlayerActivity extends Activity {
             controller.setCoverPicker(null);
             controller.setPluginPicker(null);
             controller.setFileSavePicker(null);
+            // 本地改动：歌单导入/导出的桥
+            controller.setPlaylistFileBridge(null);
             controller.setWebLoginLauncher(null);
             controller.setWebAuthScriptLauncher(null);
             controller.setExitListener(null);

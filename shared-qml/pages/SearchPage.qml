@@ -30,10 +30,17 @@ Item {
     property real cardH: cardTile + Math.max(52, Math.round(72 * cardTile / 200))
     property real gridTop: Ui.space2
 
-    // Pinned header: field, then the mode pills.
+    // Pinned header: field, then the mode pills, then (song mode, 2+ sources)
+    // the local source-filter row. Everything below the header is positioned
+    // off headerH, so growing the header shifts idle + results together.
     property real fieldY: Ui.space2
     property real tabsY: fieldY + query.fieldHeight + Ui.space3
-    property real headerH: tabsY + Ui.pillHeight + Ui.space3
+    property real scopeY: tabsY + Ui.pillHeight + Ui.space2
+    readonly property bool scopeVisible: player.searchMode === "song"
+                                         && player.searchScopeTabs.length > 1
+    property real headerH: page.scopeVisible
+        ? page.scopeY + 38 + Ui.space3
+        : page.tabsY + Ui.pillHeight + Ui.space3
 
     readonly property string mode: player.searchMode
     readonly property bool idle: query.text.length === 0
@@ -131,6 +138,28 @@ Item {
         SearchModePill { text: i18n.t("search.mode.albums"); selected: page.mode === "album"; onClicked: page.selectMode("album") }
         SearchModePill { text: i18n.t("search.mode.artists"); selected: page.mode === "artist"; onClicked: page.selectMode("artist") }
         SearchModePill { text: i18n.t("search.mode.playlists"); selected: page.mode === "playlist"; onClicked: page.selectMode("playlist") }
+    }
+
+    // 本地功能：音源筛选。在「全部」聚合列表和任一单个音源的结果之间切换；
+    // 宿主报告的音源少于 2 个时整行隐藏。只在歌曲模式下有意义，因为专辑/歌手/
+    // 歌单结果是宿主按 kind 各自维护的列表，不是按音源分桶的。
+    TabRowWithContour {
+        id: sourceBar
+        objectName: "searchSourceBar"
+        x: page.pad
+        y: page.scopeY
+        z: 2
+        width: page.contentW
+        height: 38
+        visible: page.scopeVisible
+        selectedTabIndex: player.searchScopeIndex
+        tabs: player.searchScopeTabs
+        // id 与标签平行对应，宿主自己掌握 id→index 映射；点一下只回传 id，
+        // 音源中途消失时由宿主回落到「全部」。
+        onTabSelected: (index) => {
+            var ids = player.searchScopeIds
+            if (index >= 0 && index < ids.length) player.setSearchScope(ids[index])
+        }
     }
 
     // Hairline under the pinned header once content scrolls beneath it.

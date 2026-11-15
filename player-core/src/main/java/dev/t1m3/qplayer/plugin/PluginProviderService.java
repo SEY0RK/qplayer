@@ -711,8 +711,13 @@ public final class PluginProviderService {
         descriptor.expiresAtMs = longValue(object.get("expiresAtMs"), 0L);
         descriptor.trial = Boolean.TRUE.equals(object.get("trial"));
         descriptor.cacheable = !Boolean.FALSE.equals(object.get("cacheable"));
+        // 本地改动：renditionId 是可选字段，插件完全可以不给。空串要与「没给」
+        // 同等对待，否则裸插件发 `renditionId: ""` 会被判成 "song.id is empty"，
+        // 表现成「这个音源什么都播不了」。
         Object rendition = object.get("renditionId");
-        if (rendition != null) descriptor.renditionId = qualify(provider, MediaKind.SONG, rendition);
+        if (rendition != null && !optionalString(rendition).isEmpty()) {
+            descriptor.renditionId = qualify(provider, MediaKind.SONG, rendition);
+        }
         return descriptor;
     }
 

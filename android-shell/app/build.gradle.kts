@@ -41,6 +41,19 @@ android {
                 keyPassword = System.getenv("QPLAYER_KEY_PASSWORD")
             }
         }
+        // CI supplies the machine's own debug keystore explicitly. Relying on
+        // AGP's implicit ~/.android/debug.keystore lookup is unsafe: if the
+        // runner cannot see it, AGP silently generates a NEW key and every
+        // installed app would become un-upgradable.
+        val perfKs = System.getenv("QPLAYER_PERF_KEYSTORE")
+        if (perfKs != null && file(perfKs).exists()) {
+            create("localPerf") {
+                storeFile = file(perfKs)
+                storePassword = System.getenv("QPLAYER_PERF_STORE_PASSWORD")
+                keyAlias = System.getenv("QPLAYER_PERF_KEY_ALIAS")
+                keyPassword = System.getenv("QPLAYER_PERF_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
@@ -65,8 +78,10 @@ android {
             versionNameSuffix = "-perf"
             isDebuggable = false
             matchingFallbacks += "release"
-            signingConfig = signingConfigs.getByName("debug")
-            manifestPlaceholders["appLabel"] = "QPlayer (perf)"
+            signingConfig = if (signingConfigs.findByName("localPerf") != null) signingConfigs.getByName("localPerf") else signingConfigs.getByName("debug")
+            // 本地改动：桌面上的显示名改成「QPlayer 本地版」，不再带 (perf) 后缀，
+            // 免得和官方包混在一起分不清。
+            manifestPlaceholders["appLabel"] = "QPlayer 本地版"
         }
     }
 
