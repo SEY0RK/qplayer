@@ -1,4 +1,10 @@
-name: release
+name: build-artifacts
+# Builds the two installable packages and keeps them as downloadable workflow
+# artifacts. Nothing is published to GitHub Releases.
+#
+# Trigger: Actions -> build-artifacts -> Run workflow -> pick branch `local-v2`.
+# (The upstream `release.yml` on the default branch registers the workflow path;
+# this file replaces its behaviour when the run targets local-v2.)
 on:
   push:
     tags: ['v*']
@@ -9,9 +15,9 @@ on:
         required: false
         default: '2.1.1-local.1'
 permissions:
-  contents: write
+  contents: read
 concurrency:
-  group: release-${{ github.ref }}
+  group: build-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -146,19 +152,17 @@ jobs:
           name: QPlayer-windows-jvm-portable
           path: desktop-host/target/QPlayer-windows-x64-portable.zip
 
-  publish:
+  bundle:
+    # One artifact with both packages, so a single download is enough.
     needs: [android, windows-portable]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
-      - name: Verify all assets present
+      - name: Verify both packages are present and non-trivial
         run: python .github/scripts/verify-release-assets.py dist
-      - name: Publish GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.version || github.ref_name }}
-        run: |
-          set -euo pipefail
-          gh release create "$TAG" dist/* --title "QPlayer $TAG" --notes "v2.1.1-based local build: JVM portable zip (no data/) + Android perf APK. Signature fingerprint asserted in CI." || gh release upload "$TAG" dist/* --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QPlayer-local-build
+          path: dist/*
