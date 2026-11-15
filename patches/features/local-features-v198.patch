@@ -1,0 +1,1289 @@
+diff --git a/android-shell/app/src/main/java/dev/t1m3/qplayer/android/ui/QPlayerActivity.java b/android-shell/app/src/main/java/dev/t1m3/qplayer/android/ui/QPlayerActivity.java
+@@ -78,10 +78,22 @@ public final class QPlayerActivity extends Activity {
+     private static final int REQ_PLUGIN_PICK = 5;
+     private static final int REQ_FONT_PICK = 6;
+     private static final int REQ_AUDIO_SAVE = 7;
++    // 本地改动：歌单导入/导出用 9、10。上游 REQ_AUDIO_SAVE 已占 7，8 留空避让。
++    private static final int REQ_PLAYLIST_IMPORT = 9;
++    private static final int REQ_PLAYLIST_EXPORT = 10;
+ 
+     /** Canonical playlist id awaiting a picked cover image, set right before
+      *  launching the gallery picker and consumed in {@link #onActivityResult}. */
+     private String pendingCoverPlaylistKey;
++
++    /** 本地改动：歌单导入/导出的中间状态。控制器那侧的桥只说文件系统路径，
++     *  而系统选择器给回的是 content:// Uri，所以两个方向都先把文件暂存在应用私有
++     *  缓存里，这几个字段负责跨 picker 往返传递另一半信息。 */
++    private Consumer<String> pendingPlaylistImportSink;
++    private Consumer<String> pendingPlaylistExportSink;
++    private java.nio.file.Path pendingPlaylistExportStaging;
++    private android.net.Uri pendingPlaylistExportTarget;
++
+     private AudioSaveRequest pendingAudioSave;
+     private final java.util.Set<AudioSaveRequest> audioSaves =
+             java.util.concurrent.ConcurrentHashMap.newKeySet();
+@@ -148,6 +160,13 @@ private void startEngine() {
+                     deleteRecursive(updates);
+                     deleteRecursive(dev.t1m3.qplayer.store.AppDirs.cacheDir()
+                             .resolve("plugin-imports").toFile());
++                    // 本地改动：暂存的歌单传输文件。没走完的 picker 往返（系统对话框
++                    // 期间 Activity 被重建、用户中途杀进程）会留下私有副本，而暂存副本
++                    // 本来也不是用户要留的那份。
++                    deleteRecursive(dev.t1m3.qplayer.store.AppDirs.cacheDir()
++                            .resolve("playlist-imports").toFile());
++                    deleteRecursive(dev.t1m3.qplayer.store.AppDirs.cacheDir()
++                            .resolve("playlist-exports").toFile());
+                     try {
+                         dev.t1m3.qplayer.plugin.PluginCompatibility.setHostVersion(
+                                 app.getPackageManager().getPackageInfo(app.getPackageName(), 0).versionName);
+@@ -258,6 +277,8 @@ private void attachEngine(EngineState state) {
+         controller.setPluginPicker(this::pickPluginPackage);
+         controller.setFileSavePicker(this::saveAudioFile);
+         controller.setWebLoginLauncher(this::openWebLogin);
++        // 本地改动：安卓侧的歌单导入/导出（SAF）。
++        controller.setPlaylistFileBridge(new AndroidPlaylistFileBridge());
+         webAuthScript = new AndroidWebAuthScript(this);
+         controller.setWebAuthScriptLauncher(webAuthScript::run);
+ 
+@@ -774,6 +795,130 @@ private void pickPluginPackage() {
+         }
+     }
+ 
++    /**
++     * 本地改动：安卓侧的歌单导入/导出。
++     *
++     * <p>{@link PlayerController.PlaylistFileBridge} 只说普通文件系统路径，而
++     * Storage Access Framework 的选择器只会给回 {@code content://} Uri —— 应用私有
++     * 缓存是这台宿主既能写、又能当路径交给控制器的地方，所以两个方向都在那里暂存：
++     *
++     * <ul>
++     *   <li>导入 —— 把选中的文档复制进缓存，把该路径交出去，由控制器解析；</li>
++     *   <li>导出 —— 先交出暂存路径，控制器写完后在 {@link #written} 里把文件发布到
++     *       用户选定的位置。</li>
++     * </ul>
++     */
++    private final class AndroidPlaylistFileBridge implements PlayerController.PlaylistFileBridge {
++
++        @Override
++        public void open(Consumer<String> onPicked) {
++            pendingPlaylistImportSink = onPicked;
++            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
++            intent.addCategory(Intent.CATEGORY_OPENABLE);
++            // 自家文件叫 ".qpl.json"，各家 provider 对它的 MIME 判断不一致：认后缀的
++            // 给 application/json，不认的给 text/plain 或 application/octet-stream。
++            // 过滤太窄会把用户自己的导出文件在那些猜错的文件管理器里直接藏掉，所以
++            // 这里放宽，格式检查放到解析之后。
++            intent.setType("*/*");
++            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
++                "application/json", "text/plain", "application/octet-stream", "*/*"
++            });
++            try {
++                startActivityForResult(intent, REQ_PLAYLIST_IMPORT);
++            } catch (Throwable error) {
++                pendingPlaylistImportSink = null;
++                dev.t1m3.qplayer.util.Logger.error(
++                        "no document provider to import a playlist: {}", error.toString());
++            }
++        }
++
++        @Override
++        public void save(String suggestedFileName, Consumer<String> onPicked) {
++            java.nio.file.Path staging = newPlaylistStagingPath("playlist-exports");
++            if (staging == null) {
++                showTransferToast(I18n.tr("toast.localPlaylist.exportFailed"));
++                return;
++            }
++            pendingPlaylistExportStaging = staging;
++            pendingPlaylistExportSink = onPicked;
++            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
++            intent.addCategory(Intent.CATEGORY_OPENABLE);
++            intent.setType("application/json");
++            if (suggestedFileName != null && !suggestedFileName.isEmpty()) {
++                // 只是预填文件名；用户仍可改名，某些 provider 遇到不认识的扩展名还会自己再补一个。
++                intent.putExtra(Intent.EXTRA_TITLE, suggestedFileName);
++            }
++            try {
++                startActivityForResult(intent, REQ_PLAYLIST_EXPORT);
++            } catch (Throwable error) {
++                pendingPlaylistExportStaging = null;
++                pendingPlaylistExportSink = null;
++                dev.t1m3.qplayer.util.Logger.error(
++                        "no document provider to export a playlist: {}", error.toString());
++                showTransferToast(I18n.tr("toast.localPlaylist.exportFailed"));
++            }
++        }
++
++        @Override
++        public void written(String path, boolean success) {
++            // 在控制器的 io 线程上执行，永远不在 UI 线程。
++            android.net.Uri target = pendingPlaylistExportTarget;
++            pendingPlaylistExportTarget = null;
++            if (!success || target == null || path == null) return;
++            publishExportedPlaylist(java.nio.file.Paths.get(path), target);
++        }
++    }
++
++    /** 应用私有缓存里的一个全新传输暂存文件；缓存本身不可用时返回 null。 */
++    private java.nio.file.Path newPlaylistStagingPath(String folder) {
++        try {
++            java.nio.file.Path dir = dev.t1m3.qplayer.store.AppDirs.cacheDir().resolve(folder);
++            java.nio.file.Files.createDirectories(dir);
++            return dir.resolve(java.util.UUID.randomUUID().toString() + ".qpl.json");
++        } catch (Throwable error) {
++            dev.t1m3.qplayer.util.Logger.warn(
++                    "playlist staging directory unavailable: {}", error.toString());
++            return null;
++        }
++    }
++
++    /** 把写好的暂存文件复制到用户选定的位置，然后删掉暂存副本。不在 UI 线程上跑。
++     *
++     *  <p>这里失败必须自己报出来：控制器在它那侧写完的那一刻就已经报过导出成功了，
++     *  它看不到 SAF 这一半。 */
++    private void publishExportedPlaylist(java.nio.file.Path staging, android.net.Uri target) {
++        new Thread(() -> {
++            boolean published = false;
++            try (InputStream in = java.nio.file.Files.newInputStream(staging);
++                 java.io.OutputStream out = getContentResolver().openOutputStream(target, "wt")) {
++                if (out != null) {
++                    byte[] buffer = new byte[16 * 1024];
++                    int read;
++                    while ((read = in.read(buffer)) > 0) out.write(buffer, 0, read);
++                    out.flush();
++                    published = true;
++                }
++            } catch (Throwable error) {
++                dev.t1m3.qplayer.util.Logger.warn(
++                        "publishing exported playlist failed: {}", error.toString());
++            } finally {
++                try {
++                    java.nio.file.Files.deleteIfExists(staging);
++                } catch (Throwable ignored) {
++                }
++            }
++            if (!published) {
++                showTransferToast(I18n.tr("toast.localPlaylist.exportFailed"));
++            }
++        }, "qplayer-playlist-export").start();
++    }
++
++    /** 从任意线程弹 toast；传输路径按设计本来就不在 UI 线程上。 */
++    private void showTransferToast(String message) {
++        runOnUiThread(() -> android.widget.Toast.makeText(
++                this, message, android.widget.Toast.LENGTH_SHORT).show());
++    }
++
+     private void openWebLogin(String loginUrl, String cookieUrl,
+             String credentialCookieName, String providerName) {
+         runOnUiThread(() -> {
+@@ -862,6 +1007,48 @@ protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+             }, "qplayer-plugin-pick").start();
+             return;
+         }
++        // 本地改动：歌单导入 —— 选中的文档先复制进私有缓存，控制器只认真实路径。
++        if (requestCode == REQ_PLAYLIST_IMPORT) {
++            Consumer<String> sink = pendingPlaylistImportSink;
++            pendingPlaylistImportSink = null;
++            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null
++                    || sink == null) {
++                return;
++            }
++            final android.net.Uri uri = data.getData();
++            new Thread(() -> {
++                // 控制器在它自己的 io 线程上异步读取并消费这个文件，所以这里不删，
++                // 交给下次启动时的清扫。
++                java.nio.file.Path staging = newPlaylistStagingPath("playlist-imports");
++                if (staging == null) return;
++                try (InputStream in = getContentResolver().openInputStream(uri)) {
++                    if (in == null) return;
++                    java.nio.file.Files.copy(in, staging,
++                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
++                    sink.accept(staging.toString());
++                } catch (Throwable error) {
++                    dev.t1m3.qplayer.util.Logger.warn(
++                            "read picked playlist failed: {}", error.toString());
++                }
++            }, "qplayer-playlist-import").start();
++            return;
++        }
++        // 本地改动：歌单导出 —— 到现在才让控制器开始写，写进暂存文件；
++        // written() 再把它发布到刚选定的位置。
++        if (requestCode == REQ_PLAYLIST_EXPORT) {
++            Consumer<String> sink = pendingPlaylistExportSink;
++            java.nio.file.Path staging = pendingPlaylistExportStaging;
++            pendingPlaylistExportSink = null;
++            pendingPlaylistExportStaging = null;
++            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null
++                    || sink == null || staging == null) {
++                // 在 picker 上取消：暂存路径没有交到控制器手上，什么都不会写出去。
++                return;
++            }
++            pendingPlaylistExportTarget = data.getData();
++            sink.accept(staging.toString());
++            return;
++        }
+         if (requestCode != REQ_COVER_PICK || resultCode != Activity.RESULT_OK || data == null) return;
+         android.net.Uri uri = data.getData();
+         if (uri == null) return;
+@@ -1240,6 +1427,8 @@ protected void onDestroy() {
+             controller.setCoverPicker(null);
+             controller.setPluginPicker(null);
+             controller.setFileSavePicker(null);
++            // 本地改动：歌单导入/导出的桥
++            controller.setPlaylistFileBridge(null);
+             controller.setWebLoginLauncher(null);
+             controller.setWebAuthScriptLauncher(null);
+             controller.setExitListener(null);
+diff --git a/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/DesktopWindow.java b/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/DesktopWindow.java
+@@ -4,6 +4,10 @@
+ import io.github.timer_err.qml4j.render.QmlView;
+ import io.github.timer_err.qml4j.render.ResourceLoader;
+ import io.github.timer_err.qml4j.render.items.core.Item;
++// 本地改动（框内预编辑）：需要按 TextInput 的组合态写 preedit，并按 TextEditable 的
++// 选区接口在组合开始时吃掉已选中的字符。
++import io.github.timer_err.qml4j.render.items.input.TextEditable;
++import io.github.timer_err.qml4j.render.items.input.TextInput;
+ 
+ import dev.t1m3.qplayer.bridge.PlayerController;
+ import dev.t1m3.qplayer.qml.BundledQml;
+@@ -130,6 +134,9 @@ public final class DesktopWindow {
+     // WinFrameless is created per createWindow() call (see its own javadoc for why).
+     private WindowChrome windowChrome;
+     private WinFrameless frameless;
++    // 本地改动：Windows 专用输入法桥。其他平台为 null；每次 createWindow() 重建，
++    // 理由同 WinFrameless（它挂的是某一个窗口的 GLFW 回调）。
++    private ImeBridge imeBridge;
+     // 确保nudgeResizeOnce只调用一次，避免从托盘恢复时累积增加窗口尺寸
+     private boolean nudgeApplied = false;
+     private static volatile Boolean windows11OrLater;
+@@ -169,6 +176,77 @@ int[] framebufferSize() {
+         return new int[]{fbW, fbH};
+     }
+ 
++    /** 把组合光标的列交给输入法，参数是 QML 逻辑单位。
++     *
++     *  <p>每帧在渲染线程调用（只有那一线程能读 QML 几何），换算成客户区像素在
++     *  这里做完，GLFW 事件循环那边就能把数字原样交给 GLFW/imm32。窗口是无边框的，
++     *  客户端原点就是场景原点 (0,0)，唯一的换算是 DPI 缩放。 */
++    void setImeCursorRectangle(float left, float top, float width, float height) {
++        ImeBridge bridge = imeBridge;
++        if (bridge == null) return;
++        float scale = uiScale <= 0f ? 1f : uiScale;
++        bridge.setCursorRectangle(
++                Math.round(left * scale),
++                Math.round(top * scale),
++                Math.max(1, Math.round(width * scale)),
++                Math.max(1, Math.round(height * scale)));
++    }
++
++    /**
++     * 给 {@code ImePositioner} 用的原生 HWND（非 Windows 上为 null）。
++     * 窗口刚建好、{@code GLFW_IME} 还没打开时装钩子，才能从第一帧组合起
++     * 就收到每一条 {@code WM_IME_*}。
++     */
++    com.sun.jna.Pointer nativeHwnd() {
++        return nativeWindow;
++    }
++
++    /** 输入法的组合串变了。在渲染线程调用；{@code started} 标记一次组合的第一帧，
++     *  这时要先把已选中的内容吃掉，提交结果才能落在选区原来的位置。 */
++    void applyImePreedit(String text, int caret, boolean started) {
++        QmlView v = view;
++        if (v == null) return;
++        Item focused = v.focused();
++        if (!(focused instanceof TextInput)) return;
++        TextInput input = (TextInput) focused;
++        if (started) beginComposition(input);
++        input.preeditText.set(text);
++        input.preeditCursor.set(Math.max(0, Math.min(caret, text.length())));
++    }
++
++    /** 组合替换选区，跟 Qt 和浏览器的行为一致：第一个 preedit 到达之前先删掉选中
++     *  的字符，提交结果才会落在它们原来的位置。包级可见，方便不开窗口也测这条规则。 */
++    static void beginComposition(TextEditable input) {
++        int selStart = input.selectionStart();
++        int selEnd = input.selectionEnd();
++        if (selStart == selEnd) return;
++        String s = input.text();
++        if (s == null) s = "";
++        int lo = Math.max(0, Math.min(selStart, selEnd));
++        int hi = Math.min(s.length(), Math.max(selStart, selEnd));
++        if (lo < hi) {
++            input.setText(s.substring(0, lo) + s.substring(hi));
++            input.emitTextChanged();
++        }
++        input.setCursorPosition(lo);
++        input.setSelectionRange(lo, lo);
++        input.setSelectionAnchor(lo);
++    }
++
++    /** 输入法是否正握着未提交的组合串。GLFW 回调线程也会读，所以桥里那个标志是
++     *  volatile 的。 */
++    boolean imeComposing() {
++        ImeBridge bridge = imeBridge;
++        return bridge != null && bridge.composing();
++    }
++
++    /** 当前没有在编辑：把组合串丢掉，免得失焦的输入框还留着一段拼音。 */
++    void clearImePreedit() {
++        ImeBridge bridge = imeBridge;
++        if (bridge == null || !bridge.composing()) return;
++        applyImePreedit("", 0, false);
++    }
++
+     int refreshHz() {
+         return refreshHz;
+     }
+@@ -834,6 +912,11 @@ private void createWindow() {
+         } else if (isWindows() && settings != null) {
+             settings.setInsets(0, settings.bottomInset.peek());
+         }
++        // 本地改动：与标题栏选择无关——不打开这一步，输入法的组合窗会开在客户区原点。
++        if (isWindows()) {
++            imeBridge = new ImeBridge();
++            imeBridge.install(this);
++        }
+         if (!fullscreen) captureWindowedBounds();
+         else if (!applyFullscreenMonitor()) {
+             fullscreen = false;
+@@ -989,6 +1072,13 @@ private void fallbackToOpenGL() {
+         stopRenderThread();
+         if (window != MemoryUtil.NULL) {
+             org.lwjgl.glfw.Callbacks.glfwFreeCallbacks(window);
++            // 本地改动：HWND 即将消失/替换，先销毁隐藏 caret 并恢复 GLFW 的窗口过程。
++            ImePositioner.uninstall();
++            // 本地改动：输入法桥跟着放掉。
++            if (imeBridge != null) {
++                imeBridge.dispose();
++                imeBridge = null;
++            }
+             GLFW.glfwDestroyWindow(window);
+             window = MemoryUtil.NULL;
+         }
+@@ -1135,6 +1225,11 @@ private void installCallbacks() {
+                 input.cancelFullscreenExitHold();
+                 postRenderTask(input::cancelPointerGesture);
+             }
++            // 本地改动：失焦时丢掉残留的组合串，重新聚焦时下一次 preedit 会重新开组合。
++            if (!foc) postRenderTask(this::clearImePreedit);
++            // 本地改动：首次聚焦后安排两轮输入上下文重连（对齐 ime-debug 版）。
++            ImeBridge bridge = imeBridge;
++            if (bridge != null) bridge.onWindowFocus(foc);
+         });
+         GLFW.glfwSetWindowIconifyCallback(window, (win, iconified) -> {
+             windowIconified = iconified;
+@@ -1287,6 +1382,13 @@ public void runEventLoop() {
+             // Block briefly so a hidden-to-tray window doesn't spin the CPU, but stay
+             // responsive to tray actions posted to the main-task queue.
+             GLFW.glfwWaitEventsTimeout(0.05);
++            // 本地改动：GLFW/imm32 都绑定线程，组合光标矩形只能在主线程应用，
++            // 不能交给量出这个数字的渲染线程。
++            if (imeBridge != null) {
++                imeBridge.flushCursorRectangle();
++                // 启动期输入上下文重连也是线程亲和的，一并在这里推进。
++                imeBridge.tick();
++            }
+             Runnable r;
+             while ((r = mainTasks.poll()) != null) {
+                 try {
+@@ -1348,6 +1450,13 @@ public void shutdown() {
+         }
+         if (window != MemoryUtil.NULL) {
+             org.lwjgl.glfw.Callbacks.glfwFreeCallbacks(window);
++            // 本地改动：HWND 即将消失/替换，先销毁隐藏 caret 并恢复 GLFW 的窗口过程。
++            ImePositioner.uninstall();
++            // 本地改动：输入法桥跟着放掉。
++            if (imeBridge != null) {
++                imeBridge.dispose();
++                imeBridge = null;
++            }
+             GLFW.glfwDestroyWindow(window);
+             window = MemoryUtil.NULL;
+         }
+diff --git a/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/SearchPlaylistEmptyStateTest.java b/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/SearchPlaylistEmptyStateTest.java
+@@ -0,0 +1,159 @@
++package dev.t1m3.qplayer.desktop.window;
++
++import dev.t1m3.qplayer.audio.AudioBackend;
++import dev.t1m3.qplayer.bridge.PlayerController;
++import dev.t1m3.qplayer.desktop.resources.ClasspathResourceLoader;
++import dev.t1m3.qplayer.desktop.settings.JsonSettingsStore;
++import dev.t1m3.qplayer.i18n.I18n;
++import dev.t1m3.qplayer.settings.SettingsCatalog;
++import dev.t1m3.qplayer.settings.SettingsCore;
++import dev.t1m3.qplayer.store.AppDirs;
++import io.github.timer_err.qml4j.engine.QmlEngine;
++import io.github.timer_err.qml4j.engine.binding.DirtyQueue;
++import io.github.timer_err.qml4j.engine.binding.Property;
++import io.github.timer_err.qml4j.render.QmlView;
++import io.github.timer_err.qml4j.render.items.core.Item;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.lang.reflect.Proxy;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Path;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++
++/**
++ * 歌单搜索的空状态（本地改动）。
++ *
++ * <p>歌单搜索只靠插件声明 {@code searchPlaylists} 能力，宿主没有内置实现。旧插件都不提供时，
++ * 上游页面是一片什么都不画的空白 —— 用户看到的是"白屏"，而不是"没有结果"。这个测试锁住
++ * 两种情况各自的提示：没有音源支持 vs 有音源但没命中。
++ */
++public final class SearchPlaylistEmptyStateTest {
++
++    @Rule public final TemporaryFolder temporary = new TemporaryFolder();
++
++    @Test
++    public void unsupportedSourcesExplainWhyThePageIsEmpty() throws Exception {
++        withScene((view, player) -> {
++            player.playlistSearchSupported.set(false);
++            setQuery(view, "周杰伦");
++            settle(view);
++
++            Item empty = view.findByObjectName("searchPlaylistEmpty");
++            assertNotNull("SearchPage must carry the playlist empty state", empty);
++            assertTrue("with no supporting source the empty state must show",
++                    empty.visible.peek());
++            assertEquals("当前音源不支持歌单搜索", property(empty, "title").peek());
++        });
++    }
++
++    @Test
++    public void supportedSourcesShowNoResultsCopy() throws Exception {
++        withScene((view, player) -> {
++            player.playlistSearchSupported.set(true);
++            setQuery(view, "周杰伦");
++            settle(view);
++
++            Item empty = view.findByObjectName("searchPlaylistEmpty");
++            assertNotNull(empty);
++            assertTrue(empty.visible.peek());
++            assertEquals("没有找到歌单", property(empty, "title").peek());
++        });
++    }
++
++    @Test
++    public void nothingIsShownOutsidePlaylistMode() throws Exception {
++        withScene((view, player) -> {
++            player.playlistSearchSupported.set(false);
++            player.setSearchMode("song");
++            setQuery(view, "周杰伦");
++            settle(view);
++
++            Item empty = view.findByObjectName("searchPlaylistEmpty");
++            assertNotNull(empty);
++            assertFalse("song mode must not show the playlist empty state",
++                    empty.visible.peek());
++        });
++    }
++
++    private static void setQuery(QmlView view, String text) throws Exception {
++        Item field = view.findByObjectName("searchQuery");
++        assertNotNull("searchQuery", field);
++        property(field, "text").set(text);
++    }
++
++    private void withScene(SceneCheck check) throws Exception {
++        String oldBase = AppDirs.base();
++        String oldCache = AppDirs.cacheBase();
++        PlayerController player = null;
++        QmlView view = null;
++        try {
++            Path base = temporary.newFolder().toPath();
++            AppDirs.setBase(base.toString());
++            AppDirs.setCacheBase(base.resolve("cache").toString());
++            AudioBackend backend = (AudioBackend) Proxy.newProxyInstance(
++                    AudioBackend.class.getClassLoader(), new Class<?>[]{AudioBackend.class},
++                    (proxy, method, args) -> {
++                        if (method.getReturnType() == boolean.class) return false;
++                        if (method.getReturnType() == long.class) return 0L;
++                        return null;
++                    });
++            player = new PlayerController(backend, track -> { });
++            SettingsCore settings = new SettingsCore();
++            settings.load(new JsonSettingsStore(), SettingsCatalog.DESKTOP);
++            ClasspathResourceLoader resources = new ClasspathResourceLoader();
++            view = QmlView.withStockTypes(new QmlEngine()).resources(resources)
++                    .context("player", player).context("settings", settings)
++                    .context("i18n", I18n.instance());
++            view.load(rebaseImports(new String(
++                    resources.load("pages/SearchPage.qml"), StandardCharsets.UTF_8)));
++            settle(view);
++            player.setSearchMode("playlist");
++            settle(view);
++            check.run(view, player);
++        } finally {
++            if (view != null) {
++                try { view.dispose(); } catch (Throwable ignored) { }
++            }
++            if (player != null) {
++                try { player.shutdownAsync().join(); } catch (Throwable ignored) { }
++            }
++            AppDirs.setBase(oldBase);
++            AppDirs.setCacheBase(oldCache);
++        }
++    }
++
++    private static String rebaseImports(String source) {
++        return source.replace("import \".\"", "import \"pages\"")
++                     .replace("import \"../components\"", "import \"components\"");
++    }
++
++    @SuppressWarnings("unchecked")
++    private static <T> Property<T> property(Item item, String name) throws Exception {
++        return (Property<T>) item.getClass().getField(name).get(item);
++    }
++
++    private static void settle(QmlView view) {
++        DirtyQueue queue = view.dirtyQueue();
++        queue.install();
++        try {
++            for (int i = 0; i < 3; i++) {
++                queue.flush();
++                view.renderer().layoutOnly(view.root());
++            }
++            queue.flush();
++        } finally {
++            queue.uninstall();
++        }
++    }
++
++    @FunctionalInterface
++    private interface SceneCheck {
++        void run(QmlView view, PlayerController player) throws Exception;
++    }
++}
+diff --git a/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/SearchSourceFilterTest.java b/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/SearchSourceFilterTest.java
+@@ -0,0 +1,123 @@
++package dev.t1m3.qplayer.desktop.window;
++
++import dev.t1m3.qplayer.audio.AudioBackend;
++import dev.t1m3.qplayer.bridge.PlayerController;
++import dev.t1m3.qplayer.desktop.resources.ClasspathResourceLoader;
++import dev.t1m3.qplayer.desktop.settings.JsonSettingsStore;
++import dev.t1m3.qplayer.i18n.I18n;
++import dev.t1m3.qplayer.settings.SettingsCatalog;
++import dev.t1m3.qplayer.settings.SettingsCore;
++import dev.t1m3.qplayer.store.AppDirs;
++import io.github.timer_err.qml4j.engine.QmlEngine;
++import io.github.timer_err.qml4j.engine.binding.DirtyQueue;
++import io.github.timer_err.qml4j.render.QmlView;
++import io.github.timer_err.qml4j.render.items.core.Item;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.lang.reflect.Proxy;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Path;
++import java.util.Arrays;
++import java.util.Collections;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++
++/**
++ * SearchPage's source filter row.
++ *
++ * <p>qml4j gives QML no compile-time checking: a wrong property name or a binding
++ * to a method that does not exist renders a silently dead control, and this page is
++ * only reached through a {@code Loader} that stays inactive until the user opens
++ * search — so neither the app's startup nor a normal smoke run ever parses it. That
++ * is exactly how the row went missing once before, hence a scene test that drives
++ * the host property it is bound to.
++ */
++public class SearchSourceFilterTest {
++
++    @Rule public TemporaryFolder temporary = new TemporaryFolder();
++
++    @Test
++    public void theSourceFilterRowShowsOnlyWhenThereIsMoreThanOneSource() throws Exception {
++        String oldBase = AppDirs.base();
++        String oldCache = AppDirs.cacheBase();
++        PlayerController player = null;
++        QmlView view = null;
++        try {
++            Path base = temporary.newFolder().toPath();
++            AppDirs.setBase(base.toString());
++            AppDirs.setCacheBase(base.resolve("cache").toString());
++            AudioBackend backend = (AudioBackend) Proxy.newProxyInstance(
++                    AudioBackend.class.getClassLoader(), new Class<?>[]{AudioBackend.class},
++                    (proxy, method, args) -> {
++                        if (method.getReturnType() == boolean.class) return false;
++                        if (method.getReturnType() == long.class) return 0L;
++                        return null;
++                    });
++            player = new PlayerController(backend, track -> { });
++            SettingsCore settings = new SettingsCore();
++            settings.load(new JsonSettingsStore(), SettingsCatalog.DESKTOP);
++            ClasspathResourceLoader resources = new ClasspathResourceLoader();
++            view = QmlView.withStockTypes(new QmlEngine()).resources(resources)
++                    .context("player", player).context("settings", settings)
++                    .context("i18n", I18n.instance());
++            view.load(rebaseImports(new String(
++                    resources.load("pages/SearchPage.qml"), StandardCharsets.UTF_8)));
++            settle(view);
++
++            Item bar = view.findByObjectName("searchSourceBar");
++            assertNotNull("SearchPage must carry the source-filter row", bar);
++
++            // One source (here: none) means there is nothing to switch between, so
++            // the row must not take up a line of the page.
++            assertFalse("with no per-source buckets the row must stay hidden",
++                    bar.visible.peek());
++
++            // Two or more sources is exactly when it earns its space.
++            player.searchScopeTabs.set(Arrays.asList(I18n.tr("search.scope.all"), "网易云"));
++            settle(view);
++            assertTrue("with two sources the row must appear", bar.visible.peek());
++
++            // ...and collapse again when the search narrows back to a single source.
++            player.searchScopeTabs.set(Collections.<String>emptyList());
++            settle(view);
++            assertFalse("the row must hide again when the sources collapse",
++                    bar.visible.peek());
++        } finally {
++            if (view != null) {
++                try { view.dispose(); } catch (Throwable ignored) { }
++            }
++            if (player != null) {
++                try { player.shutdownAsync().join(); } catch (Throwable ignored) { }
++            }
++            AppDirs.setBase(oldBase);
++            AppDirs.setCacheBase(oldCache);
++        }
++    }
++
++    /** {@code load(String)} parses against the resource root, not the file's own
++     *  directory, so the page's relative imports have to be rebased — otherwise
++     *  {@code import "."} resolves to the root and the sibling components (TabRow,
++     *  SongRow, …) are not found. */
++    private static String rebaseImports(String source) {
++        return source.replace("import \".\"", "import \"pages\"")
++                     .replace("import \"../components\"", "import \"components\"");
++    }
++
++    private static void settle(QmlView view) {
++        DirtyQueue queue = view.dirtyQueue();
++        queue.install();
++        try {
++            for (int i = 0; i < 3; i++) {
++                queue.flush();
++                view.renderer().layoutOnly(view.root());
++            }
++            queue.flush();
++        } finally {
++            queue.uninstall();
++        }
++    }
++}
+diff --git a/player-core/src/main/java/dev/t1m3/qplayer/bridge/PlayerController.java b/player-core/src/main/java/dev/t1m3/qplayer/bridge/PlayerController.java
+@@ -591,6 +591,41 @@ private void notifyPlayback() {
+     public final Property<List<SearchRow>> searchRows = new Property<>(Collections.<SearchRow>emptyList());
+     /** SearchPage's type filter: song, album, artist or playlist. */
+     public final Property<String> searchMode = new Property<>("song");
++    /** SearchPage's source filter — which providers' results {@link #searchRows}
++     *  shows. {@value #SEARCH_SCOPE_ALL} (default) keeps the aggregated list every
++     *  enabled source contributes to; any other value is a provider id and narrows
++     *  the list to that one source.
++     *
++     *  <p>This is a <em>view</em> filter, not a re-query: the search still runs
++     *  against every enabled provider and {@link #rebuildSearchRows} still merges
++     *  them in stable provider order — switching scope only hides rows. That matters
++     *  because re-querying would need a fresh round of network calls just to switch
++     *  back to "all", and would leave {@link #pluginSearchByProvider} missing the
++     *  buckets that {@link #searchRows}' row indices point into.
++     *
++     *  <p>Setting it is therefore cheap and synchronous: no network, no debounce. */
++    public final Property<String> searchScope = new Property<>(SEARCH_SCOPE_ALL);
++    /** {@link #searchScope} value meaning "every enabled source". */
++    public static final String SEARCH_SCOPE_ALL = "all";
++    /** Source-filter chips for SearchPage, as display labels:
++     *  {@code ["全部音源", "网易云", "哔哩哔哩", ...]}. Derived from the buckets
++     *  {@link #pluginSearchByProvider} actually filled, so QML never keeps its own
++     *  provider list that could drift out of sync with them.
++     *
++     *  <p>A Property rather than a getter because qml4j binds QML to Property reads;
++     *  a plain method call would only be re-evaluated when some unrelated property
++     *  happened to change. */
++    public final Property<List<String>> searchScopeTabs =
++            new Property<>(Collections.<String>emptyList());
++    /** Provider ids parallel to {@link #searchScopeTabs}; index 0 is
++     *  {@value #SEARCH_SCOPE_ALL}. QML passes {@code searchScopeIds[i]} straight to
++     *  {@link #setSearchScope(String)} on a chip tap. */
++    public final Property<List<String>> searchScopeIds =
++            new Property<>(Collections.<String>emptyList());
++    /** Index of the active chip, mirroring {@link #searchScope} into
++     *  {@link #searchScopeIds} — lets QML drive {@code TabRow.selectedTabIndex}
++     *  without mapping id to index itself. */
++    public final Property<Integer> searchScopeIndex = new Property<>(0);
+     public final Property<List<NeteaseAlbum>> searchAlbumResults = new Property<>(Collections.<NeteaseAlbum>emptyList());
+     public final Property<List<NeteaseArtist>> searchArtistResults = new Property<>(Collections.<NeteaseArtist>emptyList());
+     public final Property<List<Album>> sourceSearchAlbumResults =
+@@ -601,6 +636,16 @@ private void notifyPlayback() {
+             new Property<>(Collections.<Playlist>emptyList());
+     /** Successful page batches trigger viewport refill even when deduplication adds no rows. */
+     public final Property<Long> searchPlaylistPageRevision = new Property<>(0L);
++    /**
++     * 本地改动：当前有没有音源能搜歌单。
++     *
++     * <p>歌单搜索在 v1.9.8 里完全靠插件声明 {@link ProviderCapability#SEARCH_PLAYLISTS}，
++     * 宿主自己没有任何内置实现。旧的插件（1.8.x 那批）都没这个方法，于是
++     * {@code searchPlaylists} 找不到任何音源、一条请求都不发，界面就剩一片空白 —— 看起来
++     * 像"搜不到歌单"，实际是"根本没人能搜"。这个 Property 让 SearchPage 能把两种情况
++     * 分开说清楚：没有音源支持时提示去更新插件，有音源但没命中时提示换个词。
++     */
++    public final Property<Boolean> playlistSearchSupported = new Property<>(false);
+     /** Local-library matches for the same query text, shown alongside searchResults. */
+     public final Property<List<Track>> localSearchResults = new Property<>(Collections.<Track>emptyList());
+     /** Hot search keywords shown when search input is empty. */
+@@ -3836,6 +3881,20 @@ public void setCurrentVersion(String version) {
+         }
+     }
+ 
++    /**
++     * 本地改动：默认不再检查官方更新。
++     *
++     * <p>这个分支是本地修改版（JVM 打包的桌面版 / 加了本地改动的安卓包），
++     * 官方发布的资产我们既装不上、也不该装——桌面版官方是 GraalVM 原生 exe + 原生
++     * WebView2 组件，安卓版是另一套签名。真让用户点了「更新」，轻则下载一个装不了的包，
++     * 重则覆盖掉本地改动。所以启动时的静默检查直接不发请求，设置页手动点「检查更新」
++     * 也只回一句「已是最新版」。
++     *
++     * <p>想恢复官方行为，加 JVM 参数 {@code -Dqplayer.update.check=true} 即可。
++     */
++    private static final boolean UPDATE_CHECK_ENABLED =
++            Boolean.parseBoolean(System.getProperty("qplayer.update.check", "false"));
++
+     /**
+      * Silent (startup) check — no feedback when already up to date or on failure, only the update
+      * dialog when a newer release is actually found.
+@@ -3868,6 +3927,12 @@ public void checkForUpdateManual() {
+     public void checkForUpdate(boolean manual) {
+         synchronized (QmlRuntimeLock.MONITOR) {
+             if (appShuttingDown) return;
++            // 本地改动：默认不检查更新（见 UPDATE_CHECK_ENABLED）。
++            // 手动点击仍给一句反馈，否则按钮看起来像坏的。
++            if (!UPDATE_CHECK_ENABLED) {
++                if (manual) showToast(I18n.tr("toast.update.upToDate"));
++                return;
++            }
+             String version = currentVersion;
+             boolean mirror = updateMirror;
+             AssetMatcher matcher = assetMatcher;
+@@ -5188,6 +5253,15 @@ public interface PlaylistFileBridge {
+         void open(java.util.function.Consumer<String> onPicked);
+         /** Choose where to write, seeded with {@code suggestedFileName}. */
+         void save(String suggestedFileName, java.util.function.Consumer<String> onPicked);
++
++        /** 本地改动（安卓 SAF）：写入 {@code path} 结束后回调，成功与失败都调。
++         *
++         *  <p>直接给出真实目标路径的宿主不需要实现——文件已经在用户指定的位置。
++         *  只能给出暂存路径的宿主需要它：安卓的 Storage Access Framework 返回的是
++         *  {@code content://} Uri 而不是文件系统路径，宿主拿到暂存文件后再发布到用户
++         *  真正选定的位置，无论成败都要清掉暂存副本。 */
++        default void written(String path, boolean success) {
++        }
+     }
+ 
+     private volatile PlaylistFileBridge playlistFiles;
+@@ -5220,8 +5294,11 @@ public void requestLocalPlaylistExport(String playlistId) {
+                             bridge.save(
+                                     suggested,
+                                     path ->
+-                                            worker.submit(
++                                            // 本地改动：导出是本地文件写入，不排到网络队列
++                                            // （worker 遇到不可达主机会堵满整个 TCP 超时）。
++                                            ioWorker.submit(
+                                                     () -> {
++                                                        boolean written = false;
+                                                         try {
+                                                             String json =
+                                                                     PlaylistTransfer.export(
+@@ -5232,6 +5309,7 @@ public void requestLocalPlaylistExport(String playlistId) {
+                                                             StorageFiles.writeUtf8Atomic(
+                                                                     java.nio.file.Paths.get(path),
+                                                                     json);
++                                                            written = true;
+                                                             post(
+                                                                     () ->
+                                                                             showToast(
+@@ -5250,10 +5328,23 @@ public void requestLocalPlaylistExport(String playlistId) {
+                                                                                     I18n.tr(
+                                                                                             "toast.localPlaylist.exportFailed")));
+                                                         }
++                                                        // 放最后：宿主若要把暂存文件发布出去，
++                                                        // 也是在成功/失败提示入队之后，不会挡住写入。
++                                                        notifyPlaylistWritten(bridge, path, written);
+                                                     })));
+         }
+     }
+ 
++    /** 把写完（或写失败）的导出结果交回宿主桥。宿主侧出错不能影响已经完成的导出。 */
++    private static void notifyPlaylistWritten(
++            PlaylistFileBridge bridge, String path, boolean success) {
++        try {
++            bridge.written(path, success);
++        } catch (Throwable error) {
++            Logger.warn("playlist write notification failed: {}", error.getMessage());
++        }
++    }
++
+     public void requestLocalPlaylistImport() {
+         synchronized (QmlRuntimeLock.MONITOR) {
+             PlaylistFileBridge bridge = playlistFiles;
+@@ -5265,7 +5356,8 @@ public void requestLocalPlaylistImport() {
+                     () ->
+                             bridge.open(
+                                     path ->
+-                                            worker.submit(
++                                            // 本地改动：导入同样是本地文件读取，走 ioWorker。
++                                            ioWorker.submit(
+                                                     () -> {
+                                                         try {
+                                                             String json =
+@@ -7258,7 +7350,14 @@ public void searchPlaylists(String keyword) {
+                 pluginSearchCursors.put(provider.id, "");
+                 cursors.put(provider.id, "");
+             }
+-            if (!cursors.isEmpty()) searchPlaylistPages(cursors);
++            // 本地改动：把「有没有音源能搜歌单」告诉 QML。空集时下面一条请求都不会发，
++            // 列表永远是空的；不带上这个标记，界面就只是一片没有任何说明的空白。
++            playlistSearchSupported.set(!cursors.isEmpty());
++            if (!cursors.isEmpty()) {
++                searchPlaylistPages(cursors);
++            } else {
++                Logger.info("no enabled provider advertises searchPlaylists; playlist search skipped");
++            }
+         }
+     }
+ 
+@@ -7474,6 +7573,15 @@ private boolean searchPlugins(String query, String key) {
+             pluginProviderNames.put(manifest.id, manifest.name);
+             pluginSearchCursors.put(manifest.id, "");
+         }
++        // The scope is a user preference and survives a new query, but the provider
++        // it names may have been disabled since. Reset to "all" in that case so the
++        // results list is never filtered down to a source that no longer exists
++        // (which would render as an empty page while the query clearly matched).
++        String scope = searchScope.peek();
++        if (scope != null && !scope.isEmpty() && !SEARCH_SCOPE_ALL.equals(scope)
++                && !pluginSearchByProvider.containsKey(scope)) {
++            searchScope.set(SEARCH_SCOPE_ALL);
++        }
+         rebuildSearchRows();
+         if (providers.isEmpty()) return false;
+         searchLoading.set(true);
+@@ -7578,8 +7686,25 @@ public void searchLocal(String keyword) {
+      * #searchAlbumResults}/{@link #searchArtistResults}, bypassing this list. */
+     void rebuildSearchRows() {
+         List<SearchRow> rows = new ArrayList<>();
++
++        // Source scope (SearchPage's source filter). "all" keeps every source; a
++        // provider id narrows the list to that one. Read once per rebuild so a
++        // concurrent scope change can't produce a half-filtered list.
++        //
++        // This only decides what is *shown*. row.index must still be the index
++        // inside its own source list, because playPluginSearchResult resolves the
++        // song through pluginSearchByProvider.get(providerId).get(index) — filtering
++        // must not renumber anything.
++        final String scope = searchScope.peek();
++        final boolean allSources = scope == null || scope.isEmpty()
++                || SEARCH_SCOPE_ALL.equals(scope);
++        // Local files are not an online source, so a single-source scope hides them
++        // too: the user asked to see one source, and "本地" is not it.
++        final boolean includeLocal = allSources;
++        final boolean includeLegacyNetease = allSources || "netease".equals(scope);
++
+         List<NeteaseSong> ns = searchResults.peek();
+-        if (ns != null) {
++        if (includeLegacyNetease && ns != null) {
+             for (int i = 0; i < ns.size(); i++) {
+                 NeteaseSong s = ns.get(i);
+                 SearchRow row = new SearchRow();
+@@ -7614,6 +7739,7 @@ void rebuildSearchRows() {
+         }
+         for (int rank = 0; rank < deepest; rank++) {
+             for (Map.Entry<String, List<Song>> provider : pluginSearchByProvider.entrySet()) {
++                if (!allSources && !provider.getKey().equals(scope)) continue;
+                 List<Song> songs = provider.getValue();
+                 if (songs == null || rank >= songs.size()) continue;
+                 Song song = songs.get(rank);
+@@ -7634,7 +7760,7 @@ void rebuildSearchRows() {
+             }
+         }
+         List<Track> ls = localSearchResults.peek();
+-        if (ls != null) {
++        if (includeLocal && ls != null) {
+             for (int i = 0; i < ls.size(); i++) {
+                 Track t = ls.get(i);
+                 SearchRow row = new SearchRow();
+@@ -7651,6 +7777,69 @@ void rebuildSearchRows() {
+         }
+         searchRows.set(rows);
+         if ("song".equals(searchMode.peek())) resultCount.set(rows.size());
++        rebuildSearchScopeTabs();
++    }
++
++    /** Refresh the source-filter chips ({@link #searchScopeTabs} /
++     *  {@link #searchScopeIds} / {@link #searchScopeIndex}).
++     *
++     *  <p>Runs at the end of {@link #rebuildSearchRows()} so the chips always name
++     *  exactly the buckets that exist. Only one source (or none) means there is
++     *  nothing to switch between, so the chips collapse to an empty list and
++     *  SearchPage hides the row entirely. */
++    private void rebuildSearchScopeTabs() {
++        Set<String> providers = pluginSearchByProvider.keySet();
++        if (providers.size() <= 1) {
++            if (!searchScopeTabs.peek().isEmpty()) {
++                searchScopeTabs.set(Collections.<String>emptyList());
++                searchScopeIds.set(Collections.<String>emptyList());
++                searchScopeIndex.set(0);
++            }
++            return;
++        }
++
++        List<String> ids = new ArrayList<>(providers.size() + 1);
++        List<String> labels = new ArrayList<>(providers.size() + 1);
++        ids.add(SEARCH_SCOPE_ALL);
++        labels.add(I18n.tr("search.scope.all"));
++        for (String providerId : providers) {
++            ids.add(providerId);
++            labels.add(pluginProviderNames.getOrDefault(providerId, providerId));
++        }
++
++        // A scope that no longer has a bucket (provider disabled mid-session) is
++        // reported as "all" — both here and in rebuildSearchRows, so the chip and
++        // the list can never disagree.
++        String scope = searchScope.peek();
++        int index = ids.indexOf(scope == null || scope.isEmpty() ? SEARCH_SCOPE_ALL : scope);
++        if (index < 0) {
++            index = 0;
++            searchScope.set(SEARCH_SCOPE_ALL);
++        }
++
++        searchScopeTabs.set(Collections.unmodifiableList(labels));
++        searchScopeIds.set(Collections.unmodifiableList(ids));
++        searchScopeIndex.set(index);
++    }
++
++    /** SearchPage's source filter. {@value #SEARCH_SCOPE_ALL} restores the
++     *  aggregated list; a provider id narrows it to that source.
++     *
++     *  <p>No network work happens here and no debounce is needed: the per-provider
++     *  results are already in {@link #pluginSearchByProvider}, so this is a pure
++     *  view change. Unknown ids fall back to "all" rather than showing an empty
++     *  list — a source can be disabled between renders, and an empty page with no
++     *  explanation is the worst outcome. */
++    public void setSearchScope(String scope) {
++        String next = scope == null ? "" : scope.trim();
++        if (next.isEmpty()) next = SEARCH_SCOPE_ALL;
++        if (!SEARCH_SCOPE_ALL.equals(next)
++                && !pluginSearchByProvider.containsKey(next)) {
++            Logger.info("search scope {} is not an active provider, falling back to all", next);
++            next = SEARCH_SCOPE_ALL;
++        }
++        searchScope.set(next);
++        rebuildSearchRows();
+     }
+ 
+     /**
+diff --git a/player-core/src/main/java/dev/t1m3/qplayer/plugin/PluginProviderService.java b/player-core/src/main/java/dev/t1m3/qplayer/plugin/PluginProviderService.java
+@@ -711,8 +711,13 @@ private StreamDescriptor parseStream(String provider, Object raw) {
+         descriptor.expiresAtMs = longValue(object.get("expiresAtMs"), 0L);
+         descriptor.trial = Boolean.TRUE.equals(object.get("trial"));
+         descriptor.cacheable = !Boolean.FALSE.equals(object.get("cacheable"));
++        // 本地改动：renditionId 是可选字段，插件完全可以不给。空串要与「没给」
++        // 同等对待，否则裸插件发 `renditionId: ""` 会被判成 "song.id is empty"，
++        // 表现成「这个音源什么都播不了」。
+         Object rendition = object.get("renditionId");
+-        if (rendition != null) descriptor.renditionId = qualify(provider, MediaKind.SONG, rendition);
++        if (rendition != null && !optionalString(rendition).isEmpty()) {
++            descriptor.renditionId = qualify(provider, MediaKind.SONG, rendition);
++        }
+         return descriptor;
+     }
+ 
+diff --git a/player-core/src/main/resources/lang/en_US.properties b/player-core/src/main/resources/lang/en_US.properties
+@@ -459,6 +459,7 @@ local.empty.android=No local music found\nPut songs in the Music folder
+ search.mode.songs=Songs
+ search.mode.albums=Albums
+ search.mode.artists=Artists
++search.scope.all=All sources
+ search.mode.playlists=Playlists
+ search.hint.songs=Search songs
+ search.hint.albums=Search albums
+@@ -765,6 +766,10 @@ settings.group.app=Application
+ queue.empty.title=Your queue is empty
+ queue.empty.desc=Add tracks from a song menu, or choose a song to start listening.
+ search.empty.desc=Find your favorite songs, albums and artists.
++search.empty.playlists=No playlists found
++search.empty.playlistsHint=Try another keyword, or switch to Songs.
++search.empty.playlistsUnsupported=No source supports playlist search
++search.empty.playlistsUnsupportedHint=Playlist search is provided by source plugins (searchPlaylists capability), and none of the enabled sources implement it yet. Search under Songs for now.
+ 
+ playlist.title=Playlist
+ playlist.playAll=Play
+diff --git a/player-core/src/main/resources/lang/zh_CN.properties b/player-core/src/main/resources/lang/zh_CN.properties
+@@ -459,6 +459,7 @@ local.empty.android=未找到本地音乐\n把歌曲放进 Music 文件夹
+ search.mode.songs=歌曲
+ search.mode.albums=专辑
+ search.mode.artists=歌手
++search.scope.all=全部音源
+ search.mode.playlists=歌单
+ search.hint.songs=搜索歌曲
+ search.hint.albums=搜索专辑
+@@ -765,6 +766,10 @@ settings.group.app=应用信息
+ queue.empty.title=还没有待播歌曲
+ queue.empty.desc=从歌曲菜单添加到队列，或选择一首歌开始播放。
+ search.empty.desc=搜索喜欢的歌曲、专辑和歌手。
++search.empty.playlists=没有找到歌单
++search.empty.playlistsHint=换个关键词试试，或者切到「歌曲」看看。
++search.empty.playlistsUnsupported=当前音源不支持歌单搜索
++search.empty.playlistsUnsupportedHint=歌单搜索要由音源插件提供（searchPlaylists 能力），现在启用的音源都还没实现。可以先用「歌曲」搜。
+ 
+ playlist.title=歌单
+ playlist.playAll=播放
+diff --git a/player-core/src/test/java/dev/t1m3/qplayer/bridge/SearchScopeTest.java b/player-core/src/test/java/dev/t1m3/qplayer/bridge/SearchScopeTest.java
+@@ -0,0 +1,164 @@
++package dev.t1m3.qplayer.bridge;
++
++import dev.t1m3.qplayer.media.Song;
++import dev.t1m3.qplayer.netease.NeteaseClient;
++import dev.t1m3.qplayer.store.AppDirs;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.lang.reflect.Field;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++/**
++ * SearchPage's source filter, at the level that decides what is shown.
++ *
++ * <p>Two things here are easy to get wrong and invisible from the UI: the row
++ * indices must stay relative to each provider's own bucket (playback resolves
++ * {@code pluginSearchByProvider.get(providerId).get(row.index)}, so filtering must
++ * not renumber), and a scope naming a provider that has since been disabled has to
++ * fall back to "all" rather than render an empty page for a query that matched.
++ */
++public class SearchScopeTest {
++
++    @Rule public final TemporaryFolder temporaryFolder = new TemporaryFolder();
++    @Rule public final ControllerTestLifecycle lifecycle = new ControllerTestLifecycle();
++
++    @Test
++    public void narrowingToASourceKeepsOnlyItsRowsAndDoesNotRenumberThem() throws Exception {
++        String oldBase = AppDirs.base();
++        String oldCacheBase = AppDirs.cacheBase();
++        PlayerController controller = null;
++        try {
++            controller = newController();
++            setBuckets(controller,
++                    bucket("netease", "网易云", "n1", "n2"),
++                    bucket("bilibili", "哔哩哔哩", "b1", "b2"));
++            controller.rebuildSearchRows();
++
++            // Chips name exactly the buckets that exist, "all" first.
++            assertEquals(Collections.singletonList(PlayerController.SEARCH_SCOPE_ALL),
++                    controller.searchScopeIds.peek().subList(0, 1));
++            assertEquals(Arrays.asList(PlayerController.SEARCH_SCOPE_ALL, "netease", "bilibili"),
++                    controller.searchScopeIds.peek());
++            assertEquals(Arrays.asList("网易云", "哔哩哔哩"),
++                    controller.searchScopeTabs.peek().subList(1, 3));
++            assertEquals(Integer.valueOf(0), controller.searchScopeIndex.peek());
++            assertEquals(4, controller.searchRows.peek().size());
++
++            // Narrowing keeps only that source's rows...
++            controller.setSearchScope("bilibili");
++            List<SearchRow> only = controller.searchRows.peek();
++            assertEquals(2, only.size());
++            for (SearchRow row : only) {
++                assertEquals("bilibili", row.providerId);
++            }
++            // ...and must NOT renumber them: index stays the position inside the
++            // provider's own bucket.
++            assertEquals(0, only.get(0).index);
++            assertEquals(1, only.get(1).index);
++            assertEquals(Integer.valueOf(2), controller.searchScopeIndex.peek());
++
++            // Switching back restores the aggregated list without re-querying.
++            controller.setSearchScope(PlayerController.SEARCH_SCOPE_ALL);
++            assertEquals(4, controller.searchRows.peek().size());
++            assertEquals(Integer.valueOf(0), controller.searchScopeIndex.peek());
++
++            // A provider that is not active falls back to "all" instead of showing
++            // an empty page.
++            controller.setSearchScope("no-such-provider");
++            assertEquals(4, controller.searchRows.peek().size());
++            assertEquals(PlayerController.SEARCH_SCOPE_ALL, controller.searchScope.peek());
++            assertEquals(Integer.valueOf(0), controller.searchScopeIndex.peek());
++        } finally {
++            lifecycle.close(controller);
++            AppDirs.setBase(oldBase);
++            AppDirs.setCacheBase(oldCacheBase);
++        }
++    }
++
++    /** One source (or none) leaves nothing to switch between, so the chips collapse
++     *  and SearchPage hides the row entirely. */
++    @Test
++    public void aSingleSourceOffersNoChips() throws Exception {
++        String oldBase = AppDirs.base();
++        String oldCacheBase = AppDirs.cacheBase();
++        PlayerController controller = null;
++        try {
++            controller = newController();
++            setBuckets(controller, bucket("bilibili", "哔哩哔哩", "b1"));
++            controller.rebuildSearchRows();
++            assertTrue("chips must collapse when there is only one source",
++                    controller.searchScopeTabs.peek().isEmpty());
++            assertTrue(controller.searchScopeIds.peek().isEmpty());
++            assertEquals(1, controller.searchRows.peek().size());
++
++            // Adding a second source brings them back: the "all" chip plus one per source.
++            setBuckets(controller,
++                    bucket("netease", "网易云", "n1"),
++                    bucket("bilibili", "哔哩哔哩", "b1"));
++            controller.rebuildSearchRows();
++            assertEquals(3, controller.searchScopeTabs.peek().size());
++        } finally {
++            lifecycle.close(controller);
++            AppDirs.setBase(oldBase);
++            AppDirs.setCacheBase(oldCacheBase);
++        }
++    }
++
++    private PlayerController newController() throws Exception {
++        Path base = temporaryFolder.newFolder().toPath();
++        AppDirs.setBase(base.toString());
++        AppDirs.setCacheBase(base.resolve("cache").toString());
++        dev.t1m3.qplayer.audio.AudioBackend backend =
++                (dev.t1m3.qplayer.audio.AudioBackend) java.lang.reflect.Proxy.newProxyInstance(
++                        dev.t1m3.qplayer.audio.AudioBackend.class.getClassLoader(),
++                        new Class<?>[]{dev.t1m3.qplayer.audio.AudioBackend.class},
++                        (proxy, method, args) -> {
++                            if (method.getReturnType() == boolean.class) return false;
++                            if (method.getReturnType() == long.class) return 0L;
++                            return null;
++                        });
++        return new PlayerController(backend, track -> { }, NeteaseClient.INSTANCE);
++    }
++
++    /** A provider id -> (display name, song ids) pair, in the order they should appear. */
++    private static Map.Entry<String, Object[]> bucket(String id, String name, String... songIds) {
++        return new java.util.AbstractMap.SimpleEntry<>(id, new Object[]{name, songIds});
++    }
++
++    /** Replace the render-thread provider buckets the search pipeline fills. */
++    private static void setBuckets(PlayerController controller,
++                                   Map.Entry<String, Object[]>... buckets) throws Exception {
++        Map<String, List<Song>> byProvider = new LinkedHashMap<>();
++        Map<String, String> names = new LinkedHashMap<>();
++        for (Map.Entry<String, Object[]> entry : buckets) {
++            names.put(entry.getKey(), (String) entry.getValue()[0]);
++            List<Song> songs = new ArrayList<>();
++            for (String songId : (String[]) entry.getValue()[1]) {
++                Song song = new Song();
++                song.id = songId;
++                song.title = songId;
++                songs.add(song);
++            }
++            byProvider.put(entry.getKey(), songs);
++        }
++        field(controller, "pluginSearchByProvider").set(controller, byProvider);
++        field(controller, "pluginProviderNames").set(controller, names);
++    }
++
++    private static Field field(PlayerController controller, String name) throws Exception {
++        Field f = PlayerController.class.getDeclaredField(name);
++        f.setAccessible(true);
++        return f;
++    }
++}
+diff --git a/shared-qml/pages/SearchPage.qml b/shared-qml/pages/SearchPage.qml
+@@ -70,7 +70,7 @@ Item {
+         // page instead of asking the inner layout to distribute width.
+         Item {
+             Layout.fillWidth: true
+-            Layout.preferredHeight: 134
++            Layout.preferredHeight: player.searchMode === "song" && player.searchScopeTabs.length > 1 ? 180 : 134
+             TextField {
+                 id: query
+                 objectName: "searchQuery"
+@@ -106,6 +106,32 @@ Item {
+                     if (query.text.length > 0) page.runSearchNow()
+                 }
+             }
++
++            // 本地改动：音源筛选。在「全部」聚合列表和任一单个音源的结果之间切换。
++            // 宿主报告的音源数少于 2 个时整条隐藏——只有一个音源（或没有）就没有
++            // 可筛的东西，只显示一个「全部音源」反而是噪音。
++            //
++            // 只在歌曲模式下有意义：专辑/歌手/歌单结果是宿主按 kind 各自维护的列表，
++            // 不像 searchRows 那样是按音源分桶的。
++            TabRowWithContour {
++                id: sourceBar
++                objectName: "searchSourceBar"
++                // 绝对定位而不是 Layout.*：外层是普通 Item（见上面那条注释），
++                // 布局附加属性在里面不生效，会把 chips 压成 0 尺寸。
++                x: 16
++                y: 130
++                width: Math.max(0, page.width - 32)
++                height: 38
++                visible: player.searchMode === "song" && player.searchScopeTabs.length > 1
++                selectedTabIndex: player.searchScopeIndex
++                tabs: player.searchScopeTabs
++                // 宿主让 id 与标签平行对应并自己掌握 id→index 的映射，所以点一下只回传
++                // id；索引由宿主重新推导（该音源中途消失时回落到「全部」）。
++                onTabSelected: (index) => {
++                    var ids = player.searchScopeIds
++                    if (index >= 0 && index < ids.length) player.setSearchScope(ids[index])
++                }
++            }
+         }
+ 
+ 
+@@ -665,6 +691,24 @@ Item {
+                     bottomInset: page.bottomContentInset
+                 }
+             }
++
++            // 本地改动：歌单搜索的空状态。
++            //
++            // 上游这里什么都不画：歌单搜索只依赖插件声明 searchPlaylists 能力，宿主没有
++            // 内置实现，旧插件一条都匹配不上时列表恒空，页面看起来就是"白屏"。
++            // 把两种情况分开说清楚：没有音源支持 → 提示去更新插件；有音源但没命中 → 提示换词。
++            EmptyState {
++                objectName: "searchPlaylistEmpty"
++                visible: player.searchMode === "playlist" && !player.searchLoading
++                         && playlistGrid.count === 0 && query.text.length > 0
++                icon: "music_note"
++                title: player.playlistSearchSupported
++                       ? i18n.t("search.empty.playlists")
++                       : i18n.t("search.empty.playlistsUnsupported")
++                message: player.playlistSearchSupported
++                         ? i18n.t("search.empty.playlistsHint")
++                         : i18n.t("search.empty.playlistsUnsupportedHint")
++            }
+         }
+     }
+ }

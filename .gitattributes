@@ -1,0 +1,16 @@
+* text=auto eol=lf
+*.java text eol=lf
+*.qml text eol=lf
+*.patch text eol=lf
+*.cfg text eol=lf
+*.xml text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.py text eol=lf
+*.jar binary
+*.dll binary
+*.ico binary
+*.png binary
+*.otf binary
+*.xz binary

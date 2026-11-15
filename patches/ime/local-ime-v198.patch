@@ -1,0 +1,1746 @@
+diff --git a/android-shell/app/build.gradle.kts b/android-shell/app/build.gradle.kts
+@@ -66,7 +66,9 @@ android {
+             isDebuggable = false
+             matchingFallbacks += "release"
+             signingConfig = signingConfigs.getByName("debug")
+-            manifestPlaceholders["appLabel"] = "QPlayer (perf)"
++            // 本地改动：桌面上的显示名改成「QPlayer 本地版」，不再带 (perf) 后缀，
++            // 免得和官方包混在一起分不清。
++            manifestPlaceholders["appLabel"] = "QPlayer 本地版"
+         }
+     }
+ 
+diff --git a/desktop-host/pom.xml b/desktop-host/pom.xml
+@@ -18,7 +18,10 @@
+         <!-- Java 17 source; JVM development uses JDK 21+, Native Image uses GraalVM 25.
+              Keep the Android-shared player-core on Java 8. -->
+         <maven.compiler.release>17</maven.compiler.release>
+-        <lwjgl.version>3.3.3</lwjgl.version>
++        <!-- 本地偏离：上游用 3.3.3；框内预编辑要用 GLFW 3.5 的 IME 实现
++             （glfwSetPreeditCallback / GLFW_IME / glfwSetPreeditCursorRectangle），
++             它只在 LWJGL 3.4.x 里绑定了。 -->
++        <lwjgl.version>3.4.3</lwjgl.version>
+         <!-- The native classifiers for THIS build host. Defaults target Linux x64;
+              the os-activated profiles below flip them for Windows / macOS (intel &
+              apple-silicon). Native Image cannot cross-build, so each platform's
+@@ -147,46 +150,12 @@
+                             </arguments>
+                         </configuration>
+                     </execution>
+-                    <execution>
+-                        <id>configure-native-webview</id>
+-                        <phase>generate-resources</phase>
+-                        <goals><goal>exec</goal></goals>
+-                        <configuration>
+-                            <executable>cmake</executable>
+-                            <environmentVariables><JAVA_HOME>${java.home}</JAVA_HOME></environmentVariables>
+-                            <arguments combine.self="override">
+-                                <argument>-S</argument><argument>${project.basedir}/native/webview</argument>
+-                                <argument>-B</argument><argument>${project.build.directory}/webview-native</argument>
+-                                <argument>-DCMAKE_BUILD_TYPE=Release</argument>
+-                                <argument>-DCMAKE_INSTALL_PREFIX=${project.build.outputDirectory}</argument>
+-                            </arguments>
+-                        </configuration>
+-                    </execution>
+-                    <execution>
+-                        <id>build-native-webview</id>
+-                        <phase>generate-resources</phase>
+-                        <goals><goal>exec</goal></goals>
+-                        <configuration>
+-                            <executable>cmake</executable>
+-                            <arguments combine.self="override">
+-                                <argument>--build</argument><argument>${project.build.directory}/webview-native</argument>
+-                                <argument>--config</argument><argument>Release</argument>
+-                                <argument>--parallel</argument><argument>2</argument>
+-                            </arguments>
+-                        </configuration>
+-                    </execution>
+-                    <execution>
+-                        <id>install-native-webview</id>
+-                        <phase>generate-resources</phase>
+-                        <goals><goal>exec</goal></goals>
+-                        <configuration>
+-                            <executable>cmake</executable>
+-                            <arguments combine.self="override">
+-                                <argument>--install</argument><argument>${project.build.directory}/webview-native</argument>
+-                                <argument>--config</argument><argument>Release</argument>
+-                            </arguments>
+-                        </configuration>
+-                    </execution>
++                    <!-- 本地偏离：上游在这里用 cmake 编译 native/webview 的原生 WebView2 组件。
++                         本机不安装 CMake/MSVC（哥的要求：不再下载新工具），改为直接把
++                         v1.9.8 官方发布包里同一个 qplayerwebview.dll 放在
++                         src/main/resources/native-webview/ 下，随 jar 一起打包。
++                         恢复上游构建链时，把这三段 configure/build/install-native-webview
++                         原样贴回并删掉该 dll 即可。 -->
+                     <execution>
+                         <id>native-host-metadata</id>
+                         <phase>process-classes</phase>
+@@ -421,9 +390,11 @@
+                         <groupId>org.codehaus.mojo</groupId>
+                         <artifactId>exec-maven-plugin</artifactId>
+                         <executions>
++                            <!-- 本地偏离：这一段只为 GraalVM 原生链接生成 .res（需要 rc.exe）。
++                                 JVM 绿色版打包不需要（版本信息由启动器脚本提供），故停用。 -->
+                             <execution>
+                                 <id>windows-executable-resources</id>
+-                                <phase>generate-resources</phase>
++                                <phase>none</phase>
+                                 <goals><goal>exec</goal></goals>
+                                 <configuration>
+                                     <executable>powershell</executable>
+diff --git a/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImeBridge.java b/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImeBridge.java
+@@ -0,0 +1,185 @@
++package dev.t1m3.qplayer.desktop.window;
++
++import org.lwjgl.glfw.GLFW;
++import org.lwjgl.glfw.GLFWPreeditCallback;
++import org.lwjgl.system.MemoryUtil;
++
++import dev.t1m3.qplayer.util.Logger;
++
++/**
++ * Windows-only: routes input-method composition into the QML text editor.
++ *
++ * <p>GLFW 3.5 (the native library LWJGL 3.4 ships) implements the IME itself.
++ * With {@code GLFW_IME} on it clears {@code ISC_SHOWUICOMPOSITIONWINDOW}, so the
++ * input method stops drawing its own composition window; it reports the
++ * composing run through the preedit callback and commits the final characters
++ * through the ordinary char callback. The host's only job is to say where the
++ * composing caret is, which GLFW turns into the composition rectangle and the
++ * candidate window's exclusion rect.
++ *
++ * <p>The earlier implementation (WinImeHook) subclassed the window procedure to
++ * move the system-drawn composition window onto the field. That can only ever
++ * produce a floating window lying on top of the editor, never text inside it.
++ */
++final class ImeBridge {
++
++    // Client-area pixels of the composing caret, pushed by the render thread once
++    // per frame. Only the GLFW main thread may talk to imm32, so the numbers are
++    // handed over and applied there.
++    private volatile int rectX;
++    private volatile int rectY;
++    private volatile int rectWidth;
++    private volatile int rectHeight;
++    private volatile boolean rectDirty;
++    private volatile boolean rectValid;
++
++    private volatile boolean composing;
++
++    // Invisible focus cycle (see ImePositioner.reconnect). On by default: two
++    // rounds after the first focus is what makes the IME hand out a usable
++    // candidate window on this machine, and a real focus change has side
++    // effects (taskbar / IME indicator flash, QML focus callbacks, dropped
++    // keys) that this avoids entirely. Set -Dqplayer.ime.reconnect=0 to turn
++    // it off, or a different round count to experiment.
++    private static final int RECONNECT_ROUNDS =
++            Integer.getInteger("qplayer.ime.reconnect", 2);
++    private static final long RECONNECT_DELAY_MS =
++            Long.getLong("qplayer.ime.reconnect.delay", 600L);
++    /** Minimum spacing between rounds. The event loop can wake far more often
++     *  than its 50 ms timeout (any glfwPostEmptyEvent does it), and two detach/
++     *  reattach cycles 5 ms apart are far too fast for the IME to finish
++     *  re-initialising in between. */
++    private static final long RECONNECT_GAP_MS = 150L;
++    private static final int RECONNECT_MAX_ATTEMPTS = 200;
++
++    private boolean reconnectArmed;
++    private long focusAtMs;
++    private long lastRoundAtMs;
++    private int reconnectRound;
++    private int reconnectAttempts;
++
++    private DesktopWindow window;
++    private GLFWPreeditCallback callback;   // strong ref: LWJGL callbacks must not be GC'd
++
++    void install(DesktopWindow window) {
++        this.window = window;
++        long handle = window.window();
++        // Before GLFW_IME is switched on: the positioner subclasses the window
++        // procedure so it sees every WM_IME_* from the first composition on.
++        ImePositioner.install(window.nativeHwnd());
++        GLFW.glfwSetInputMode(handle, GLFW.GLFW_IME, GLFW.GLFW_TRUE);
++        ImeDiagnostics.installMode(handle);
++        callback = GLFW.glfwSetPreeditCallback(handle,
++                (win, count, textAddress, blockCount, sizesAddress, focusedBlock, caret) ->
++                        onPreedit(count, textAddress, caret));
++        Logger.info("IME composition enabled (GLFW preedit callback installed)");
++    }
++
++    /** Runs on the GLFW main thread, inside the window procedure. */
++    private void onPreedit(int count, long address, int caret) {
++        String text = readCodePoints(address, count);
++        boolean started = !composing && !text.isEmpty();
++        composing = !text.isEmpty();
++        int caretIndex = utf16Index(text, caret);
++        ImeDiagnostics.logPreedit(text, caretIndex, started);
++        DesktopWindow target = window;
++        if (target != null) target.postRenderTask(() -> target.applyImePreedit(text, caretIndex, started));
++    }
++
++    /** Publish the composing caret rectangle (client-area pixels) and wake the
++     *  event loop, which is the thread allowed to talk to imm32. */
++    void setCursorRectangle(int x, int y, int width, int height) {
++        if (rectValid && x == rectX && y == rectY && width == rectWidth && height == rectHeight) {
++            ImeDiagnostics.logRectSuppressed(x, y, width, height);
++            return;
++        }
++        ImeDiagnostics.logRectArrive(x, y, width, height);
++        rectX = x;
++        rectY = y;
++        rectWidth = width;
++        rectHeight = height;
++        rectValid = true;
++        rectDirty = true;
++        GLFW.glfwPostEmptyEvent();
++    }
++
++    /** Called on the GLFW main thread: applies the latest rectangle the render
++     *  thread published.
++     *
++     *  <p>Two steps on purpose. {@code glfwSetPreeditCursorRectangle} keeps
++     *  GLFW's own preedit state in sync (it is also what re-applies the forms on
++     *  focus regain), then {@link ImePositioner} writes the full positioning
++     *  path -- {@code CFS_CANDIDATEPOS} plus the system caret -- immediately
++     *  after it. Doing it here, in the same thread and message, makes the
++     *  positioner the last writer and leaves exactly one authoritative
++     *  candidate position. */
++    void flushCursorRectangle() {
++        if (!rectDirty) return;
++        rectDirty = false;
++        DesktopWindow target = window;
++        if (target == null) return;
++        int w = Math.max(1, rectWidth);
++        int h = Math.max(1, rectHeight);
++        ImePositioner.setRectangle(rectX, rectY, w, h);
++        ImeDiagnostics.logRectPush(rectX, rectY, w, h);
++        GLFW.glfwSetPreeditCursorRectangle(target.window(), rectX, rectY, w, h);
++        ImePositioner.apply("rect-flush");
++    }
++
++    /** 窗口即将销毁/重建：放掉回调强引用，避免再往旧 HWND 投递组合串。 */
++    void dispose() {
++        window = null;
++        callback = null;
++    }
++
++    boolean composing() { return composing; }
++
++    /** Told by the window's focus callback (GLFW main thread). Arms the
++     *  invisible focus cycle the first time the window is focused, then leaves
++     *  it to {@link #tick()}. */
++    void onWindowFocus(boolean focused) {
++        if (!focused || RECONNECT_ROUNDS <= 0 || reconnectArmed) return;
++        reconnectArmed = true;
++        focusAtMs = System.currentTimeMillis();
++        Logger.info("IME reconnect armed: {} round(s), {} ms after first focus",
++                RECONNECT_ROUNDS, RECONNECT_DELAY_MS);
++    }
++
++    /** Runs once per event-loop turn on the GLFW main thread. Performs at most
++     *  one reconnect round per turn so the message pump gets to process
++     *  whatever the detach queued before the next one. */
++    void tick() {
++        if (!reconnectArmed || reconnectRound >= RECONNECT_ROUNDS) return;
++        long now = System.currentTimeMillis();
++        if (now - focusAtMs < RECONNECT_DELAY_MS) return;
++        if (lastRoundAtMs != 0L && now - lastRoundAtMs < RECONNECT_GAP_MS) return;
++        if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
++            Logger.info("IME reconnect abandoned after {} attempts", reconnectAttempts);
++            reconnectRound = RECONNECT_ROUNDS;
++            return;
++        }
++        reconnectAttempts++;
++        if (ImePositioner.reconnect(reconnectRound + 1, RECONNECT_ROUNDS)) {
++            reconnectRound++;
++            reconnectAttempts = 0;
++            lastRoundAtMs = now;
++            Logger.info("IME reconnect round {}/{} done", reconnectRound, RECONNECT_ROUNDS);
++        }
++    }
++
++    /** The preedit callback hands over UTF-32 code points, not UTF-16 units. */
++    private static String readCodePoints(long address, int count) {
++        if (address == 0L || count <= 0) return "";
++        StringBuilder text = new StringBuilder(count);
++        for (int i = 0; i < count; i++) {
++            text.appendCodePoint(MemoryUtil.memGetInt(address + (long) i * 4));
++        }
++        return text.toString();
++    }
++
++    /** The callback's caret is a code-point index; the editor counts UTF-16 units. */
++    private static int utf16Index(String text, int codePointIndex) {
++        int codePoints = text.codePointCount(0, text.length());
++        return text.offsetByCodePoints(0, Math.max(0, Math.min(codePointIndex, codePoints)));
++    }
++}
+diff --git a/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImeDiagnostics.java b/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImeDiagnostics.java
+@@ -0,0 +1,135 @@
++package dev.t1m3.qplayer.desktop.window;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.nio.file.StandardOpenOption;
++import java.time.LocalDateTime;
++import java.time.format.DateTimeFormatter;
++
++/**
++ * IME 现场诊断（精简版，2026-11-05 随 {@code ImePositioner} 一起从 v1.8.5 搬回）。
++ *
++ * <p>原版是 1132 行的完整消息网抓取器，绑在旧的消息钩子与 qml4j 0.2.33 的
++ * {@code Flickable}/{@code TextInput} 上；本版只保留 {@link ImePositioner} /
++ * {@link ImeBridge} / {@code DesktopWindow} 实际调用到的入口，签名逐一对齐，
++ * 因此那两个类可以按 v1.8.5 原文使用，不需要改动一行逻辑。
++ *
++ * <p>默认完全关闭：只有 {@code -Dqplayer.ime.debug=true} 时才写
++ * {@code <data.dir>/logs/ime-debug.log}。真机上候选窗位置再出问题时，加上这个
++ * 参数打一次中文，日志里会看到每一次 {@code apply}/{@code skip} 的理由、
++ * 写入的矩形、caret 的建毁，足够定位。
++ */
++final class ImeDiagnostics {
++
++    private static final boolean ENABLED = Boolean.getBoolean("qplayer.ime.debug");
++
++    private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
++
++    private static boolean failed;
++
++    private ImeDiagnostics() {}
++
++    // ------------------------------------------------------------------
++    // Lifecycle
++
++    /** 原版在这里装消息钩子。精简版不装：{@code ImePositioner} 自己就是那个钩子。 */
++    static void install(com.sun.jna.Pointer hwnd) {
++        if (!ENABLED) return;
++        line("DIAG install hwnd=" + hex(hwnd));
++    }
++
++    /** 原版在这里钩 GLFW 的模式切换。精简版只记一行。 */
++    static void installMode(long glfwHandle) {
++        if (!ENABLED) return;
++        line("DIAG installMode glfw=0x" + Long.toHexString(glfwHandle));
++    }
++
++    /** 事件循环每轮调用；原版在这里做心跳与窗口枚举。 */
++    static void tick() {
++        // 精简版没有周期性内容可写，保留入口以免调用方分叉。
++    }
++
++    // ------------------------------------------------------------------
++    // Positioner
++
++    static void logPosition(long seq, String reason, String detail) {
++        if (!ENABLED) return;
++        line("POSITION #" + seq + " reason=" + reason + " " + detail);
++    }
++
++    static void logCaret(String action, boolean ok, int x, int y, String extra) {
++        if (!ENABLED) return;
++        line("CARET " + action + " ok=" + (ok ? 1 : 0) + " at " + x + "," + y
++                + (extra == null || extra.isEmpty() ? "" : " " + extra));
++    }
++
++    static void logReconnect(int round, int total, boolean ok, String detail) {
++        if (!ENABLED) return;
++        line("RECONNECT " + round + "/" + total + " ok=" + (ok ? 1 : 0) + " " + detail);
++    }
++
++    // ------------------------------------------------------------------
++    // Bridge / window
++
++    static void logFocus(boolean focused) {
++        if (!ENABLED) return;
++        line("FOCUS " + focused);
++    }
++
++    static void logPreedit(String text, int caret, boolean started) {
++        if (!ENABLED) return;
++        line("PREEDIT started=" + started + " caret=" + caret + " text=\"" + text + "\"");
++    }
++
++    static void logRectArrive(int x, int y, int w, int h) {
++        if (!ENABLED) return;
++        line("RECT arrive " + x + "," + y + " " + w + "x" + h);
++    }
++
++    static void logRectSuppressed(int x, int y, int w, int h) {
++        if (!ENABLED) return;
++        line("RECT suppressed " + x + "," + y + " " + w + "x" + h);
++    }
++
++    static void logRectPush(int x, int y, int w, int h) {
++        if (!ENABLED) return;
++        line("RECT push " + x + "," + y + " " + w + "x" + h);
++    }
++
++    static void logCoordinateTransform(float logicalX, float logicalY, float logicalW, float logicalH,
++                                       float scale, int px, int py, int pw, int ph) {
++        if (!ENABLED) return;
++        line("SCALE " + scale + " logical=" + logicalX + "," + logicalY + " "
++                + logicalW + "x" + logicalH + " px=" + px + "," + py + " " + pw + "x" + ph);
++    }
++
++    // ------------------------------------------------------------------
++
++    private static synchronized void line(String text) {
++        if (failed) return;
++        try {
++            Path path = logPath();
++            Path parent = path.getParent();
++            if (parent != null) Files.createDirectories(parent);
++            Files.writeString(path, LocalDateTime.now().format(TIME) + " " + text + "\n",
++                    StandardCharsets.UTF_8,
++                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
++        } catch (IOException | RuntimeException error) {
++            // 诊断失败绝不能影响界面：写一次就闭嘴。
++            failed = true;
++        }
++    }
++
++    private static Path logPath() {
++        String dir = System.getProperty("qplayer.data.dir");
++        if (dir == null || dir.isEmpty()) dir = "data";
++        return Paths.get(dir, "logs", "ime-debug.log");
++    }
++
++    private static String hex(com.sun.jna.Pointer p) {
++        return p == null ? "null" : "0x" + Long.toHexString(com.sun.jna.Pointer.nativeValue(p));
++    }
++}
+diff --git a/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImePositioner.java b/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImePositioner.java
+@@ -0,0 +1,654 @@
++package dev.t1m3.qplayer.desktop.window;
++
++import com.sun.jna.Native;
++import com.sun.jna.Pointer;
++import com.sun.jna.Structure;
++import com.sun.jna.win32.StdCallLibrary;
++import com.sun.jna.win32.W32APIOptions;
++
++import dev.t1m3.qplayer.util.Logger;
++import org.lwjgl.system.Platform;
++
++import java.util.Arrays;
++import java.util.List;
++
++/**
++ * Windows-only: the single place that tells the input method where the
++ * composing caret is.
++ *
++ * <p>GLFW 3.5.1 (the IME build LWJGL 3.4.3 ships) only writes
++ * {@code ImmSetCompositionWindow(CFS_RECT)} and
++ * {@code ImmSetCandidateWindow(CFS_EXCLUDE)} -- see
++ * {@code _glfwUpdatePreeditCursorRectangleWin32} in the clear-code IME branch.
++ * It never sets {@code CFS_CANDIDATEPOS} and never owns a system caret. Chinese
++ * IMEs driven through imm32 (CUAS mode, which is what a non-TSF app gets) do
++ * not always honour the candidate form: Microsoft Pinyin falls back to
++ * {@code GetCaretPos()} when it decides to. With no caret in the thread that
++ * call yields the default position, so the candidate list is created off the
++ * caret or not shown at all -- while the composition still works, which is
++ * exactly the reported symptom (digits select, candidate bar missing).
++ *
++ * <p>Chromium solves this in {@code IMM32Manager}: for Chinese/Japanese it
++ * creates a 1x1 caret that is never shown, sets {@code CFS_CANDIDATEPOS} and
++ * {@code SetCaretPos()} next to the caret rectangle, then keeps the
++ * {@code CFS_EXCLUDE} form for IMEs that use it. This class ports only that
++ * positioning mechanism.
++ *
++ * <p>Ordering: the window procedure subclass chains to the previous procedure
++ * (GLFW, plus the diagnostics hook when enabled) <em>first</em> and applies the
++ * forms <em>after</em> it returns. GLFW therefore cannot overwrite what we
++ * write in the same message, which keeps this the last writer on the thread.
++ *
++ * <p>Threading: every entry point that touches imm32 or the caret runs on the
++ * thread that owns the window -- the window procedure or the GLFW event loop.
++ * The render thread only publishes the rectangle through
++ * {@link #setRectangle(int, int, int, int)}.
++ *
++ * <p>Coordinates: client-area pixels of the window, top-left origin. QML scene
++ * coordinates are logical units and are scaled by the caller
++ * ({@code DesktopWindow.setImeCursorRectangle}) before they arrive here.
++ */
++final class ImePositioner {
++
++    private static final int GWL_WNDPROC = -4;
++
++    private static final int WM_DESTROY = 0x0002;
++    private static final int WM_MOVE = 0x0003;
++    private static final int WM_SIZE = 0x0005;
++    private static final int WM_SETFOCUS = 0x0007;
++    private static final int WM_KILLFOCUS = 0x0008;
++    private static final int WM_NCDESTROY = 0x0082;
++    private static final int WM_IME_STARTCOMPOSITION = 0x010D;
++    private static final int WM_IME_SETCONTEXT = 0x0281;
++    private static final int WM_IME_NOTIFY = 0x0282;
++    private static final int WM_DPICHANGED = 0x02E0;
++
++    private static final int SIZE_MINIMIZED = 1;
++
++    // WM_IME_NOTIFY commands we care about.
++    private static final int IMN_OPENCANDIDATE = 0x0005;
++    private static final int IMN_CHANGECANDIDATE = 0x0006;
++    private static final int IMN_SETCANDIDATEPOS = 0x0009;
++
++    // CANDIDATEFORM.dwStyle
++    private static final int CFS_RECT = 0x0001;
++    private static final int CFS_CANDIDATEPOS = 0x0040;
++    private static final int CFS_EXCLUDE = 0x0080;
++
++    // PRIMARYLANGID values that get a system caret (Chromium's rule).
++    private static final int LANG_CHINESE = 0x04;
++    private static final int LANG_JAPANESE = 0x11;
++
++    private static Pointer hwnd;
++    private static long prevWndProc;
++    private static WndProc hook;
++    private static volatile boolean installed;
++
++    // Client-area pixels of the composing caret, published by the event loop.
++    private static volatile int rectX;
++    private static volatile int rectY;
++    private static volatile int rectW = 1;
++    private static volatile int rectH = 1;
++    private static volatile boolean rectValid;
++
++    // The system caret is a per-thread resource; only touch it when this window
++    // created it and still has focus.
++    private static boolean caretCreated;
++    private static boolean applying;
++
++    private static long lastSeq;
++    private static volatile String lastSummary = "none";
++
++    private ImePositioner() {
++    }
++
++    // ------------------------------------------------------------------
++    // Lifecycle
++
++    /** Installs the window-procedure subclass. Call on the window's thread,
++     *  after the HWND exists and before GLFW_IME is switched on. */
++    static void install(Pointer hWnd) {
++        if (hWnd == null) return;
++        if (Platform.get() != Platform.WINDOWS) return;
++        // A rebuilt window (OpenGL fallback) brings a new HWND; drop the old hook.
++        if (installed && hwnd != null
++                && Pointer.nativeValue(hwnd) != Pointer.nativeValue(hWnd)) {
++            uninstall();
++        }
++        if (installed) return;
++        hwnd = hWnd;
++        hook = (h, msg, wParam, lParam) -> onMessage(h, msg, wParam, lParam);
++        try {
++            prevWndProc = U32.I.SetWindowLongPtrW(hWnd, GWL_WNDPROC, hook);
++            installed = true;
++            Logger.info("IME positioning hook installed (previous wndproc 0x{})",
++                    Long.toHexString(prevWndProc));
++        } catch (Throwable t) {
++            Logger.warn("IME positioning hook not installed: {}", t.toString());
++        }
++    }
++
++    /** Destroys the caret and restores the previous window procedure. */
++    static void uninstall() {
++        if (!installed) return;
++        destroyCaret("uninstall");
++        installed = false;
++        try {
++            if (hwnd != null && prevWndProc != 0L) {
++                U32.I.SetWindowLongPtrW(hwnd, GWL_WNDPROC, Pointer.createConstant(prevWndProc));
++            }
++        } catch (Throwable ignored) {
++        }
++        hwnd = null;
++        prevWndProc = 0L;
++    }
++
++    // ------------------------------------------------------------------
++    // Rectangle
++
++    /** Publishes the composing caret in client-area pixels. Runs on the GLFW
++     *  main thread; the values are applied by the next {@link #apply}. */
++    static void setRectangle(int x, int y, int width, int height) {
++        rectX = x;
++        rectY = y;
++        rectW = Math.max(1, width);
++        rectH = Math.max(1, height);
++        rectValid = true;
++    }
++
++    // ------------------------------------------------------------------
++    // Window procedure
++
++    private static long onMessage(Pointer h, int msg, long wParam, long lParam) {
++        long result;
++        try {
++            result = prevWndProc != 0L
++                    ? U32.I.CallWindowProcW(prevWndProc, h, msg, wParam, lParam)
++                    : U32.I.DefWindowProcW(h, msg, wParam, lParam);
++        } catch (Throwable t) {
++            Logger.warn("IME wndproc chain failed (msg=0x{}): {}",
++                    Integer.toHexString(msg), t.toString());
++            result = 0L;
++        }
++        try {
++            react(h, msg, wParam, lParam);
++        } catch (Throwable t) {
++            Logger.warn("IME positioning failed (msg=0x{}): {}",
++                    Integer.toHexString(msg), t.toString());
++        }
++        return result;
++    }
++
++    private static void react(Pointer h, int msg, long wParam, long lParam) {
++        switch (msg) {
++            case WM_IME_SETCONTEXT:
++                // wParam tells whether the IME is active for this window; this is
++                // where Chromium creates/destroys its caret too.
++                if (wParam != 0) {
++                    ensureCaret();
++                    apply("ime-setcontext-on");
++                } else {
++                    destroyCaret("ime-setcontext-off");
++                }
++                break;
++            case WM_SETFOCUS:
++                ensureCaret();
++                apply("setfocus");
++                break;
++            case WM_KILLFOCUS:
++                destroyCaret("killfocus");
++                break;
++            case WM_SIZE:
++                if ((wParam & 0xFFFFL) == SIZE_MINIMIZED) destroyCaret("minimize");
++                else apply("resize");
++                break;
++            case WM_MOVE:
++            case WM_DPICHANGED:
++                apply("move");
++                break;
++            case WM_IME_STARTCOMPOSITION:
++                // The IME is about to open its composition/candidate UI: this is
++                // the last moment a position can be handed over before it reads
++                // one. Chromium's OnImeStartComposition does the same.
++                ensureCaret();
++                apply("ime-startcomposition");
++                break;
++            case WM_IME_NOTIFY: {
++                int cmd = (int) (wParam & 0xFFFFL);
++                if (cmd == IMN_OPENCANDIDATE) {
++                    ensureCaret();
++                    apply("imn-opencandidate");
++                } else if (cmd == IMN_SETCANDIDATEPOS) {
++                    apply("imn-setcandidatepos");
++                } else if (cmd == IMN_CHANGECANDIDATE) {
++                    apply("imn-changecandidate");
++                }
++                break;
++            }
++            case WM_DESTROY:
++            case WM_NCDESTROY:
++                destroyCaret("destroy");
++                installed = false;
++                break;
++            default:
++                break;
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // System caret
++
++    /** Creates the hidden 1x1 caret Chromium uses for Chinese/Japanese IMEs.
++     *  Never calls {@code ShowCaret}, so nothing is drawn on screen. */
++    private static void ensureCaret() {
++        if (!installed || hwnd == null) return;
++        if (caretCreated) return;
++        // Every early return below is a silent one, and they are the whole
++        // difference between "the caret exists when the candidate window opens"
++        // and "it does not". Log them: the focus-mismatch case is the one that
++        // fires on WM_IME_SETCONTEXT, which the system delivers *before*
++        // WM_SETFOCUS, so the caret cannot be created on that message.
++        Pointer focus = U32.I.GetFocus();
++        if (focus == null || Pointer.nativeValue(focus) != Pointer.nativeValue(hwnd)) {
++            ImeDiagnostics.logCaret("skip", false, 0, 0,
++                    "reason=focus-mismatch focus=" + hex(focus) + " hwnd=" + hex(hwnd));
++            return;
++        }
++        if (!isCjkLayout()) {
++            ImeDiagnostics.logCaret("skip", false, 0, 0,
++                    "reason=non-cjk-layout lang=0x" + Integer.toHexString(langId()));
++            return;
++        }
++        boolean ok = U32.I.CreateCaret(hwnd, null, 1, 1);
++        caretCreated = ok;
++        ImeDiagnostics.logCaret(ok ? "create" : "create-failed", ok, 0, 0, "lang=" + langId());
++    }
++
++    private static void destroyCaret(String reason) {
++        if (!caretCreated) {
++            ImeDiagnostics.logCaret("skip", false, 0, 0,
++                    "reason=no-caret-to-destroy why=" + reason);
++            return;
++        }
++        boolean ok = U32.I.DestroyCaret();
++        caretCreated = false;
++        ImeDiagnostics.logCaret("destroy", ok, 0, 0, "reason=" + reason);
++    }
++
++    // ------------------------------------------------------------------
++    // Positioning
++
++    /** Writes the caret position into imm32 for the current composition.
++     *
++     *  <p>Mirrors Chromium's {@code IMM32Manager::MoveImeWindow}: for Chinese
++     *  the candidate form is set to {@code CFS_CANDIDATEPOS} first, the system
++     *  caret (when present) is moved onto the caret, and the
++     *  {@code CFS_EXCLUDE} form is written last so IMEs that position from the
++     *  exclusion rectangle get the same point. The composition rectangle stays
++     *  {@code CFS_RECT} so the IME keeps knowing the caret box even though its
++     *  composition window is suppressed.
++     *
++     *  <p>Runs on the window thread. The read-back is logged, not trusted: a
++     *  TRUE return only means imm32 stored the form. */
++    static void apply(String reason) {
++        if (!installed || hwnd == null) return;
++        // A rectangle is published only once the render thread has painted a
++        // focused text field. Every IME message that arrives before that --
++        // including the WM_IME_SETCONTEXT/WM_SETFOCUS pair at startup -- is
++        // dropped here, which is why "no POSITION line" in the log means
++        // "nothing to position yet", not "apply was never called".
++        if (!rectValid) {
++            ImeDiagnostics.logPosition(++lastSeq, reason,
++                    "skipped: no rect published yet (render thread has not seen a focused text field)");
++            return;
++        }
++        // imm32 can deliver a notification back into this window procedure
++        // while the forms are being written; one pass is enough and the
++        // recursive one would only fight the first.
++        if (applying) return;
++        applying = true;
++        Pointer imc = null;
++        try {
++            if (U32.I.IsIconic(hwnd)) {
++                ImeDiagnostics.logPosition(++lastSeq, reason, "skipped minimized");
++                return;
++            }
++            imc = Imm32.I.ImmGetContext(hwnd);
++            if (imc == null) {
++                lastSummary = "#" + (++lastSeq) + " " + reason + " no-himc";
++                ImeDiagnostics.logPosition(lastSeq, reason, "skipped: ImmGetContext=null");
++                return;
++            }
++
++            // JNA hands out a fresh Pointer wrapper per call, so "==" compares
++            // object identity and is false even when both point at the same
++            // HWND. That made every single apply() bail out as "no focus"
++            // (72/72 in the 2026-10-26 field log) and the candidate form was
++            // never written. Compare native addresses instead.
++            Pointer focus = U32.I.GetFocus();
++            boolean focused = focus != null
++                    && Pointer.nativeValue(focus) == Pointer.nativeValue(hwnd);
++            if (!focused) {
++                // Chromium returns early here too: a stale rectangle from a
++                // renderer frame must not move an IME owned by another window.
++                lastSummary = "#" + (++lastSeq) + " " + reason + " no-focus";
++                ImeDiagnostics.logPosition(lastSeq, reason, "skipped: GetFocus()!=hwnd"
++                        + " hwnd=" + hex(hwnd) + " focus=" + hex(focus));
++                return;
++            }
++
++            long seq = ++lastSeq;
++            int clientW = 0;
++            int clientH = 0;
++            RECT client = new RECT();
++            if (U32.I.GetClientRect(hwnd, client)) {
++                clientW = client.right - client.left;
++                clientH = client.bottom - client.top;
++            }
++            int x = rectX;
++            int y = rectY;
++            int w = Math.max(1, rectW);
++            int h = Math.max(1, rectH);
++            String clamp = "";
++            if (clientW > 0 && clientH > 0) {
++                int cx = Math.max(0, Math.min(x, clientW - 1));
++                int cy = Math.max(0, Math.min(y, clientH - 1));
++                if (cx != x || cy != y) {
++                    clamp = " clampedFrom=" + x + "," + y + " client=" + clientW + "x" + clientH;
++                    x = cx;
++                    y = cy;
++                }
++            }
++
++            // What imm32 held before this call: if the candidate window opened
++            // with a default position, this is where it shows up.
++            CANDIDATEFORM pre = new CANDIDATEFORM();
++            boolean preOk = Imm32.I.ImmGetCandidateWindow(imc, 0, pre);
++
++            int lang = langId();
++            int primary = lang & 0x3FF;
++
++            boolean candPosOk = false;
++            if (primary == LANG_CHINESE) {
++                CANDIDATEFORM candPos = new CANDIDATEFORM();
++                candPos.dwIndex = 0;
++                candPos.dwStyle = CFS_CANDIDATEPOS;
++                candPos.ptCurrentPos.x = x;
++                candPos.ptCurrentPos.y = y;
++                candPos.rcArea.left = 0;
++                candPos.rcArea.top = 0;
++                candPos.rcArea.right = 0;
++                candPos.rcArea.bottom = 0;
++                candPosOk = Imm32.I.ImmSetCandidateWindow(imc, candPos);
++            }
++
++            // The caret is what CUAS Chinese IMEs fall back to.
++            boolean caretOk = false;
++            if (caretCreated) {
++                int caretY = primary == LANG_JAPANESE ? y + h : y;
++                caretOk = U32.I.SetCaretPos(x, caretY);
++            }
++
++            COMPOSITIONFORM composition = new COMPOSITIONFORM();
++            composition.dwStyle = CFS_RECT;
++            composition.ptCurrentPos.x = x;
++            composition.ptCurrentPos.y = y;
++            composition.rcArea.left = x;
++            composition.rcArea.top = y;
++            composition.rcArea.right = x + w;
++            composition.rcArea.bottom = y + h;
++            boolean compositionOk = Imm32.I.ImmSetCompositionWindow(imc, composition);
++
++            // Keep the exclusion rectangle: GLFW sets it and some IMEs (Japanese,
++            // Korean) position from it. Written last, so it is what imm32 stores.
++            CANDIDATEFORM exclude = new CANDIDATEFORM();
++            exclude.dwIndex = 0;
++            exclude.dwStyle = CFS_EXCLUDE;
++            exclude.ptCurrentPos.x = x;
++            exclude.ptCurrentPos.y = y;
++            exclude.rcArea.left = x;
++            exclude.rcArea.top = y;
++            exclude.rcArea.right = x + w;
++            exclude.rcArea.bottom = y + h;
++            boolean excludeOk = Imm32.I.ImmSetCandidateWindow(imc, exclude);
++
++            CANDIDATEFORM post = new CANDIDATEFORM();
++            boolean postOk = Imm32.I.ImmGetCandidateWindow(imc, 0, post);
++
++            POINT caretPos = new POINT();
++            boolean caretReadOk = caretCreated && U32.I.GetCaretPos(caretPos);
++
++            lastSummary = "#" + seq + " " + reason
++                    + " style=" + (postOk ? styleName(post.dwStyle) : "?")
++                    + " pos=" + x + "," + y
++                    + " caret=" + (caretCreated ? (caretReadOk
++                    ? caretPos.x + "," + caretPos.y : "unreadable") : "none");
++
++            ImeDiagnostics.logPosition(seq, reason, "hwnd=0x"
++                    + Long.toHexString(Pointer.nativeValue(hwnd))
++                    + " focus=0x" + hex(U32.I.GetFocus())
++                    + " fg=0x" + hex(U32.I.GetForegroundWindow())
++                    + " enabled=" + (U32.I.IsWindowEnabled(hwnd) ? 1 : 0)
++                    + " lang=0x" + Integer.toHexString(lang)
++                    + " open=" + (Imm32.I.ImmGetOpenStatus(imc) ? 1 : 0)
++                    + " client=" + clientW + "x" + clientH
++                    + " rect=" + rectX + "," + rectY + "," + rectW + "," + rectH
++                    + clamp
++                    + " pre=" + (preOk ? form(pre) : "none")
++                    + " candPos=" + (primary == LANG_CHINESE
++                    ? "(" + x + "," + y + ")" + (candPosOk ? " ok" : " fail") : "n/a")
++                    + " exclude=(" + x + "," + y + "," + (x + w) + "," + (y + h) + ")"
++                    + (excludeOk ? " ok" : " fail")
++                    + " composition=" + (compositionOk ? "ok" : "fail")
++                    + " caret=" + (caretCreated ? "created" : "none")
++                    + (caretCreated ? (caretOk ? " moved" : " move-failed") : "")
++                    + (caretReadOk ? " at " + caretPos.x + "," + caretPos.y : "")
++                    + " post=" + (postOk ? form(post) : "none"));
++        } catch (Throwable t) {
++            ImeDiagnostics.logPosition(++lastSeq, reason, "error: " + t);
++        } finally {
++            applying = false;
++            if (imc != null) {
++                try {
++                    Imm32.I.ImmReleaseContext(hwnd, imc);
++                } catch (Throwable ignored) {
++                }
++            }
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // Input-context reconnect
++
++    /** Detaches and re-attaches the window's input context.
++     *
++     *  <p>This is the first thing GLFW's {@code _glfwSetTextInputFocusWin32}
++     *  does on blur, and what a real focus cycle ends up doing to the IME: the
++     *  context is taken away, its forms are dropped, and it is handed back in a
++     *  freshly initialised state. Doing it directly avoids the side effects of
++     *  a real focus change -- taskbar flash, IME status indicator, QML focus
++     *  callbacks, dropped keystrokes -- because the window keeps its focus the
++     *  whole time.
++     *
++     *  <p>Opt-in via {@code -Dqplayer.ime.reconnect=N}. Runs on the window
++     *  thread.
++     *
++     *  @return true when a round was actually performed. */
++    static boolean reconnect(int round, int total) {
++        if (!installed || hwnd == null) return false;
++        // Only the window's own keyboard focus matters here: ImmAssociateContext
++        // touches this HWND's input context and nothing else, so being the
++        // foreground window is irrelevant (a window can hold the thread's focus
++        // without being foreground, which is exactly what happens at startup).
++        // Same Pointer trap as in apply(): compare native addresses.
++        Pointer focus = U32.I.GetFocus();
++        if (focus == null || Pointer.nativeValue(focus) != Pointer.nativeValue(hwnd)) {
++            ImeDiagnostics.logReconnect(round, total, false,
++                    "skipped: no keyboard focus (focus=" + hex(focus) + ")");
++            return false;
++        }
++        if (applying) {
++            ImeDiagnostics.logReconnect(round, total, false, "skipped: applying");
++            return false;
++        }
++        try {
++            Pointer saved = Imm32.I.ImmAssociateContext(hwnd, null);
++            if (saved == null) {
++                // Nothing was attached: there is no state to reset.
++                ImeDiagnostics.logReconnect(round, total, false, "no context attached");
++                return false;
++            }
++            Imm32.I.ImmAssociateContext(hwnd, saved);
++            ImeDiagnostics.logReconnect(round, total, true, "detached+reattached");
++        } catch (Throwable t) {
++            ImeDiagnostics.logReconnect(round, total, false, "error: " + t);
++            return false;
++        }
++        // The forms went away with the context; put the candidate position back
++        // immediately when the caret rectangle is already known.
++        apply("reconnect");
++        return true;
++    }
++
++    /** Summary of the last positioning call, for the event log. */
++    static String lastApplySummary() {
++        return lastSummary;
++    }
++
++    private static String form(CANDIDATEFORM f) {
++        return styleName(f.dwStyle) + " pt=" + f.ptCurrentPos.x + "," + f.ptCurrentPos.y
++                + " rc=" + f.rcArea.left + "," + f.rcArea.top + ","
++                + f.rcArea.right + "," + f.rcArea.bottom;
++    }
++
++    private static String styleName(int style) {
++        if (style == CFS_CANDIDATEPOS) return "CFS_CANDIDATEPOS";
++        if (style == CFS_EXCLUDE) return "CFS_EXCLUDE";
++        if (style == CFS_RECT) return "CFS_RECT";
++        if (style == 0) return "CFS_DEFAULT";
++        return "0x" + Integer.toHexString(style);
++    }
++
++    private static String hex(Pointer p) {
++        return p == null ? "0" : Long.toHexString(Pointer.nativeValue(p));
++    }
++
++    private static int langId() {
++        try {
++            Pointer hkl = U32.I.GetKeyboardLayout(0);
++            return hkl == null ? 0 : (int) (Pointer.nativeValue(hkl) & 0xFFFFL);
++        } catch (Throwable t) {
++            return 0;
++        }
++    }
++
++    private static boolean isCjkLayout() {
++        int primary = langId() & 0x3FF;
++        return primary == LANG_CHINESE || primary == LANG_JAPANESE;
++    }
++
++    // ------------------------------------------------------------------
++    // JNA surface
++
++    private interface WndProc extends StdCallLibrary.StdCallCallback {
++        long callback(Pointer hWnd, int uMsg, long wParam, long lParam);
++    }
++
++    private interface U32 extends StdCallLibrary {
++        U32 I = Native.load("user32", U32.class, W32APIOptions.DEFAULT_OPTIONS);
++
++        Pointer GetFocus();
++        Pointer GetForegroundWindow();
++        boolean IsWindowEnabled(Pointer hWnd);
++        boolean IsIconic(Pointer hWnd);
++        boolean GetClientRect(Pointer hWnd, RECT rect);
++        long SetWindowLongPtrW(Pointer hWnd, int nIndex, WndProc newProc);
++        long SetWindowLongPtrW(Pointer hWnd, int nIndex, Pointer newProc);
++        long CallWindowProcW(long prevWndFunc, Pointer hWnd, int uMsg, long wParam, long lParam);
++        long DefWindowProcW(Pointer hWnd, int uMsg, long wParam, long lParam);
++        Pointer GetKeyboardLayout(int idThread);
++        boolean CreateCaret(Pointer hWnd, Pointer hBitmap, int width, int height);
++        boolean DestroyCaret();
++        boolean SetCaretPos(int x, int y);
++        boolean GetCaretPos(POINT point);
++    }
++
++    private interface Imm32 extends StdCallLibrary {
++        Imm32 I = Native.load("imm32", Imm32.class, W32APIOptions.DEFAULT_OPTIONS);
++
++        Pointer ImmGetContext(Pointer hWnd);
++        Pointer ImmAssociateContext(Pointer hWnd, Pointer hIMC);
++        boolean ImmReleaseContext(Pointer hWnd, Pointer hIMC);
++        boolean ImmGetOpenStatus(Pointer hIMC);
++        boolean ImmSetCandidateWindow(Pointer hIMC, CANDIDATEFORM form);
++        boolean ImmGetCandidateWindow(Pointer hIMC, int index, CANDIDATEFORM form);
++        boolean ImmSetCompositionWindow(Pointer hIMC, COMPOSITIONFORM form);
++    }
++
++    // All members are 4-byte aligned in the Win32 headers; ALIGN_NONE keeps
++    // JNA from inserting 8-byte padding for the POINT on 64-bit hosts.
++    public static class POINT extends Structure {
++        public int x;
++        public int y;
++
++        public POINT() {
++            setAlignType(ALIGN_NONE);
++        }
++
++        @Override
++        protected List<String> getFieldOrder() {
++            return Arrays.asList("x", "y");
++        }
++    }
++
++    public static class RECT extends Structure {
++        public int left;
++        public int top;
++        public int right;
++        public int bottom;
++
++        public RECT() {
++            setAlignType(ALIGN_NONE);
++        }
++
++        @Override
++        protected List<String> getFieldOrder() {
++            return Arrays.asList("left", "top", "right", "bottom");
++        }
++    }
++
++    public static class CANDIDATEFORM extends Structure {
++        public int dwIndex;
++        public int dwStyle;
++        public POINT ptCurrentPos;
++        public RECT rcArea;
++
++        public CANDIDATEFORM() {
++            setAlignType(ALIGN_NONE);
++            ptCurrentPos = new POINT();
++            rcArea = new RECT();
++        }
++
++        @Override
++        protected List<String> getFieldOrder() {
++            return Arrays.asList("dwIndex", "dwStyle", "ptCurrentPos", "rcArea");
++        }
++    }
++
++    public static class COMPOSITIONFORM extends Structure {
++        public int dwStyle;
++        public POINT ptCurrentPos;
++        public RECT rcArea;
++
++        public COMPOSITIONFORM() {
++            setAlignType(ALIGN_NONE);
++            ptCurrentPos = new POINT();
++            rcArea = new RECT();
++        }
++
++        @Override
++        protected List<String> getFieldOrder() {
++            return Arrays.asList("dwStyle", "ptCurrentPos", "rcArea");
++        }
++    }
++}
+diff --git a/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/InputBridge.java b/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/InputBridge.java
+@@ -4,6 +4,7 @@
+ import io.github.timer_err.qml4j.render.items.core.Item;
+ import io.github.timer_err.qml4j.render.items.core.MouseEvent;
+ import io.github.timer_err.qml4j.render.items.input.TextEditable;
++import io.github.timer_err.qml4j.render.items.input.TextInput;
+ 
+ import dev.t1m3.qplayer.bridge.PlayerController;
+ import dev.t1m3.qplayer.lyric.skia.LyricCompositor;
+@@ -119,6 +120,10 @@ void install(long window) {
+                 }
+                 return;
+             }
++            // 本地改动（框内预编辑）：组合进行中输入法自己掌管导航键与提交键。Windows
++            // 会把被它吃掉的键报成 VK_PROCESSKEY，但它放过来的那些（Esc 取消、方向键
++            // 移动组合光标）不能同时又落到编辑器或返回键上。
++            if (win.imeComposing() && isCompositionKey(key)) return;
+             // Text-editing shortcuts: Ctrl (Win/Linux) or Cmd (macOS) + A/C/X/V. The
+             // engine exposes copy/cut/paste as explicit calls (not part of dispatchKey)
+             // and has no select-all at all, so the host must route the accelerators —
+@@ -184,7 +189,11 @@ void install(long window) {
+             final String s = new String(Character.toChars(codepoint));
+             win.postRenderTask(() -> {
+                 QmlView v = win.view();
+-                if (v != null && !s.isEmpty()) v.dispatchKey(0, s, true);
++                if (v == null || s.isEmpty()) return;
++                // 本地改动：提交的字符到达时组合串还在（输入法随后才清），所以先
++                // 把组合清掉——否则结果会落在拼音中间。
++                win.clearImePreedit();
++                v.dispatchKey(0, s, true);
+             });
+         });
+         // Same path as Settings → 从文件导入: a dropped .qplug opens the
+@@ -261,6 +270,48 @@ void cancelFullscreenExitHold() {
+     void tick() {
+         tickFullscreenExitHold();
+         tickScroll();
++        trackImeCaret();
++    }
++
++    /** 本地改动：每帧把组合光标那一列喂给输入法。
++     *
++     *  <p>候选窗要贴着这个矩形摆并避开它，所以必须是光标自己那一列而不是整个输入框：
++     *  给整框的矩形会把候选窗钉在框外面，而不是正在输入的字符下面。
++     *  {@code preeditCaretX} 由编辑器的绘制写入——只有绘制量得出组合串的宽度。 */
++    private void trackImeCaret() {
++        QmlView v = win.view();
++        Item f = v == null ? null : v.focused();
++        if (!(f instanceof TextInput) || !f.isVisible()) {
++            win.clearImePreedit();
++            return;
++        }
++        TextInput input = (TextInput) f;
++        float[] rect = caretRect(f);
++        win.setImeCursorRectangle(rect[0] + input.preeditCaretX, rect[1],
++                1f, rect[3] - rect[1]);
++    }
++
++    /** 输入框在场景坐标里的外框 [left, top, right, bottom]，逐层累加父节点偏移。 */
++    static float[] caretRect(Item focused) {
++        float x = 0f;
++        float y = 0f;
++        Item it = focused;
++        for (int depth = 0; it != null && depth < 64; depth++) {
++            x += it.x.peekFloat();
++            y += it.y.peekFloat();
++            it = it.parent.peek();
++        }
++        return new float[]{x, y, x + focused.width.peekFloat(), y + focused.height.peekFloat()};
++    }
++
++    /** 组合进行中输入法掌管的键。 */
++    private static boolean isCompositionKey(int key) {
++        return key == GLFW.GLFW_KEY_BACKSPACE || key == GLFW.GLFW_KEY_DELETE
++                || key == GLFW.GLFW_KEY_LEFT || key == GLFW.GLFW_KEY_RIGHT
++                || key == GLFW.GLFW_KEY_UP || key == GLFW.GLFW_KEY_DOWN
++                || key == GLFW.GLFW_KEY_HOME || key == GLFW.GLFW_KEY_END
++                || key == GLFW.GLFW_KEY_ENTER || key == GLFW.GLFW_KEY_ESCAPE
++                || key == GLFW.GLFW_KEY_SPACE || key == GLFW.GLFW_KEY_TAB;
+     }
+ 
+     private void tickFullscreenExitHold() {
+diff --git a/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/WinFrameless.java b/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/WinFrameless.java
+@@ -157,18 +157,9 @@ void install(DesktopWindow window, double titleBarHeightLogicalPx,
+                 window.onNativeFramebufferResize(
+                         packed & 0xFFFF, (packed >>> 16) & 0xFFFF);
+             }
+-            if (msg == WinIme.WM_IME_REQUEST) {
+-                LRESULT answered = WinIme.answerImeRequest(
+-                        wParam.intValue(), lParam.longValue(), window);
+-                if (answered != null) return answered;
+-            }
+-            if (WinIme.isImeMessage(msg)) {
+-                LRESULT result = U32.I.CallWindowProcW(originalWndProc, h, msg, wParam, lParam);
+-                if (WinIme.shouldPlace(msg, wParam.intValue())) {
+-                    WinIme.placeCandidateWindow(h, window);
+-                }
+-                return result;
+-            }
++            // 候选窗 / 组合窗的位置不在这里管：ImePositioner 单独子类化窗口过程，
++            // 在 CallWindowProcW 之后写完整表单（CFS_CANDIDATEPOS + 系统 caret +
++            // CFS_EXCLUDE），是这条线程上唯一的写入者。见 ImePositioner 的类注释。
+             if (msg == WM_NCCALCSIZE) return ncCalcSize(h, wParam, lParam, window);
+             if (msg == WM_NCHITTEST) return hitTest(h, lParam, window, titleBarHeightLogicalPx);
+             if (msg == WM_NCACTIVATE) return U32.I.DefWindowProcW(h, msg, wParam, new LPARAM(-1));
+diff --git a/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/WinIme.java b/desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/WinIme.java
+@@ -1,229 +0,0 @@
+-package dev.t1m3.qplayer.desktop.window;
+-
+-import com.sun.jna.Native;
+-import com.sun.jna.Pointer;
+-import com.sun.jna.Structure;
+-import com.sun.jna.platform.win32.WinDef.HWND;
+-import com.sun.jna.platform.win32.WinDef.LRESULT;
+-import com.sun.jna.platform.win32.WinDef.RECT;
+-import com.sun.jna.win32.StdCallLibrary;
+-import com.sun.jna.win32.W32APIOptions;
+-
+-import io.github.timer_err.qml4j.render.QmlView;
+-import io.github.timer_err.qml4j.render.items.core.Item;
+-import io.github.timer_err.qml4j.render.items.input.TextEditable;
+-
+-import java.util.Map;
+-
+-/**
+- * Places the system IME candidate window under the focused QML text field.
+- *
+- * <p>GLFW only delivers committed Unicode via {@code glfwSetCharCallback}.
+- * Chinese/Japanese IMEs still own the candidate UI, but a custom-framed
+- * GLFW window does not advertise a caret, so Windows parks that UI at
+- * (0,0) — often clipped or fully hidden. {@code ImmSetCandidateWindow}
+- * with CFS_EXCLUDE + CFS_CANDIDATEPOS restores the usual overlay next
+- * to the field.
+- */
+-final class WinIme {
+-
+-    static final int WM_IME_STARTCOMPOSITION = 0x010D;
+-    static final int WM_IME_ENDCOMPOSITION = 0x010E;
+-    static final int WM_IME_COMPOSITION = 0x010F;
+-    static final int WM_IME_NOTIFY = 0x0282;
+-    static final int IMN_OPENCANDIDATE = 0x0005;
+-    static final int WM_IME_REQUEST = 0x0288;
+-    static final int IMR_COMPOSITIONWINDOW = 0x0001;
+-    static final int IMR_CANDIDATEWINDOW = 0x0002;
+-    static final int IMR_QUERYCHARPOSITION = 0x0006;
+-
+-    private static final int CFS_RECT = 0x0001;
+-    private static final int CFS_CANDIDATEPOS = 0x0040;
+-    private static final int CFS_EXCLUDE = 0x0080;
+-    private static final int GWLP_IMC = -12;
+-    private static boolean applying;
+-
+-    private WinIme() {}
+-
+-    static boolean isImeMessage(int msg) {
+-        return msg == WM_IME_STARTCOMPOSITION
+-                || msg == WM_IME_COMPOSITION
+-                || msg == WM_IME_NOTIFY
+-                || msg == WM_IME_ENDCOMPOSITION;
+-    }
+-
+-    static boolean shouldPlace(int msg, int wParam) {
+-        if (msg == WM_IME_NOTIFY) return (wParam & 0xFFFF) == IMN_OPENCANDIDATE;
+-        return msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_COMPOSITION;
+-    }
+-
+-    static void placeCandidateWindow(HWND hwnd, DesktopWindow window) {
+-        if (applying || hwnd == null || window == null) return;
+-        int[] box = candidateBox(window);
+-        if (box == null) return;
+-        applying = true;
+-        try {
+-            U32.I.CreateCaret(hwnd, null, 1, 1);
+-            U32.I.SetCaretPos(box[0], box[3]);
+-            Pointer imc = Imm32.I.ImmGetContext(hwnd);
+-            if (imc == null) imc = U32.I.GetWindowLongPtrW(hwnd, GWLP_IMC);
+-            if (imc == null) return;
+-            try {
+-                CANDIDATEFORM pos = new CANDIDATEFORM();
+-                pos.dwIndex = 0;
+-                pos.dwStyle = CFS_CANDIDATEPOS;
+-                pos.ptCurrentPos.x = box[0];
+-                pos.ptCurrentPos.y = box[3];
+-                Imm32.I.ImmSetCandidateWindow(imc, pos);
+-
+-                CANDIDATEFORM exclude = new CANDIDATEFORM();
+-                exclude.dwIndex = 0;
+-                exclude.dwStyle = CFS_EXCLUDE;
+-                exclude.ptCurrentPos.x = box[0];
+-                exclude.ptCurrentPos.y = box[3];
+-                exclude.rcArea.left = box[0];
+-                exclude.rcArea.top = box[1];
+-                exclude.rcArea.right = box[2];
+-                exclude.rcArea.bottom = box[3];
+-                Imm32.I.ImmSetCandidateWindow(imc, exclude);
+-
+-                COMPOSITIONFORM composition = new COMPOSITIONFORM();
+-                composition.dwStyle = CFS_RECT;
+-                composition.ptCurrentPos.x = box[0];
+-                composition.ptCurrentPos.y = box[1];
+-                composition.rcArea.left = box[0];
+-                composition.rcArea.top = box[1];
+-                composition.rcArea.right = box[2];
+-                composition.rcArea.bottom = box[3];
+-                Imm32.I.ImmSetCompositionWindow(imc, composition);
+-            } finally {
+-                Imm32.I.ImmReleaseContext(hwnd, imc);
+-            }
+-        } finally {
+-            applying = false;
+-        }
+-    }
+-
+-    static LRESULT answerImeRequest(int request, long address, DesktopWindow window) {
+-        if (address == 0 || window == null) return null;
+-        int[] box = candidateBox(window);
+-        if (box == null) return null;
+-        Pointer p = new Pointer(address);
+-        if (request == IMR_COMPOSITIONWINDOW) {
+-            COMPOSITIONFORM form = new COMPOSITIONFORM(p);
+-            form.dwStyle = CFS_RECT;
+-            form.ptCurrentPos.x = box[0];
+-            form.ptCurrentPos.y = box[1];
+-            writeRect(form.rcArea, box);
+-            form.write();
+-            return new LRESULT(1);
+-        }
+-        if (request == IMR_CANDIDATEWINDOW) {
+-            CANDIDATEFORM form = new CANDIDATEFORM(p);
+-            form.dwStyle = CFS_CANDIDATEPOS | CFS_EXCLUDE;
+-            form.ptCurrentPos.x = box[0];
+-            form.ptCurrentPos.y = box[3];
+-            writeRect(form.rcArea, box);
+-            form.write();
+-            return new LRESULT(1);
+-        }
+-        if (request == IMR_QUERYCHARPOSITION) {
+-            if (p.getInt(0) < 36) return null;
+-            p.setInt(8, box[0]);
+-            p.setInt(12, box[3]);
+-            p.setInt(16, Math.max(1, box[3] - box[1]));
+-            p.setInt(20, box[0]);
+-            p.setInt(24, box[1]);
+-            p.setInt(28, box[2]);
+-            p.setInt(32, box[3]);
+-            return new LRESULT(1);
+-        }
+-        return null;
+-    }
+-
+-    private static void writeRect(RECT rect, int[] box) {
+-        rect.left = box[0];
+-        rect.top = box[1];
+-        rect.right = box[2];
+-        rect.bottom = box[3];
+-    }
+-
+-    /**
+-     * Focused editable's client-pixel box: [left, top, right, bottom].
+-     * Visible for tests.
+-     */
+-    static int[] boxFromItem(Item root, Item item, float uiScale) {
+-        if (root == null || item == null || uiScale <= 0f) return null;
+-        Number width = item.width.peek();
+-        Number height = item.height.peek();
+-        if (width == null || height == null) return null;
+-        int w = Math.max(1, Math.round(width.floatValue() * uiScale));
+-        int h = Math.max(1, Math.round(height.floatValue() * uiScale));
+-        Map<String, Object> origin = root.mapFromItem(item, 0, 0);
+-        if (origin == null) return null;
+-        Object xObj = origin.get("x");
+-        Object yObj = origin.get("y");
+-        if (!(xObj instanceof Number) || !(yObj instanceof Number)) return null;
+-        int left = Math.round(((Number) xObj).floatValue() * uiScale);
+-        int top = Math.round(((Number) yObj).floatValue() * uiScale);
+-        return new int[]{left, top, left + w, top + h};
+-    }
+-
+-    private static int[] candidateBox(DesktopWindow window) {
+-        QmlView view = window.view();
+-        if (view == null || view.root() == null) return null;
+-        Item focused = view.focused();
+-        if (!(focused instanceof TextEditable)) return null;
+-        return boxFromItem(view.root(), focused, window.uiScale());
+-    }
+-
+-    interface U32 extends StdCallLibrary {
+-        U32 I = Native.load("user32", U32.class, W32APIOptions.UNICODE_OPTIONS);
+-        Pointer GetWindowLongPtrW(HWND hWnd, int nIndex);
+-        boolean CreateCaret(HWND hWnd, Pointer hBitmap, int nWidth, int nHeight);
+-        boolean SetCaretPos(int x, int y);
+-    }
+-
+-    interface Imm32 extends StdCallLibrary {
+-        Imm32 I = Native.load("imm32", Imm32.class, W32APIOptions.UNICODE_OPTIONS);
+-        Pointer ImmGetContext(HWND hWnd);
+-        boolean ImmReleaseContext(HWND hWnd, Pointer hIMC);
+-        boolean ImmSetCandidateWindow(Pointer hIMC, CANDIDATEFORM lpCandidate);
+-        boolean ImmSetCompositionWindow(Pointer hIMC, COMPOSITIONFORM lpCompForm);
+-    }
+-
+-    @Structure.FieldOrder({"x", "y"})
+-    public static class POINT extends Structure {
+-        public int x;
+-        public int y;
+-    }
+-
+-    @Structure.FieldOrder({"dwIndex", "dwStyle", "ptCurrentPos", "rcArea"})
+-    public static class CANDIDATEFORM extends Structure {
+-        public int dwIndex;
+-        public int dwStyle;
+-        public POINT ptCurrentPos = new POINT();
+-        public RECT rcArea = new RECT();
+-
+-        public CANDIDATEFORM() {}
+-
+-        public CANDIDATEFORM(Pointer p) {
+-            super(p);
+-            read();
+-        }
+-    }
+-
+-    @Structure.FieldOrder({"dwStyle", "ptCurrentPos", "rcArea"})
+-    public static class COMPOSITIONFORM extends Structure {
+-        public int dwStyle;
+-        public POINT ptCurrentPos = new POINT();
+-        public RECT rcArea = new RECT();
+-
+-        public COMPOSITIONFORM() {}
+-
+-        public COMPOSITIONFORM(Pointer p) {
+-            super(p);
+-            read();
+-        }
+-    }
+-}
+diff --git a/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/ImeCompositionTest.java b/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/ImeCompositionTest.java
+@@ -0,0 +1,199 @@
++package dev.t1m3.qplayer.desktop.window;
++
++import dev.t1m3.qplayer.audio.AudioBackend;
++import dev.t1m3.qplayer.bridge.PlayerController;
++import dev.t1m3.qplayer.bridge.WindowChromeStub;
++import dev.t1m3.qplayer.desktop.resources.ClasspathResourceLoader;
++import dev.t1m3.qplayer.desktop.settings.JsonSettingsStore;
++import dev.t1m3.qplayer.i18n.I18n;
++import dev.t1m3.qplayer.settings.SettingsCatalog;
++import dev.t1m3.qplayer.settings.SettingsCore;
++import dev.t1m3.qplayer.store.AppDirs;
++import io.github.timer_err.qml4j.engine.QmlEngine;
++import io.github.timer_err.qml4j.engine.binding.DirtyQueue;
++import io.github.timer_err.qml4j.engine.binding.Property;
++import io.github.timer_err.qml4j.render.QmlView;
++import io.github.timer_err.qml4j.render.items.core.Item;
++import io.github.timer_err.qml4j.render.items.input.TextInput;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.lang.reflect.Proxy;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Path;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++
++/**
++ * 本地改动（框内预编辑）：组合态必须对输入框自身的布局可见、对它的 text 不可见。
++ *
++ * <p>搜索框在拼音输入过程中要看起来「有内容」（标签上浮、清空按钮出现），但不能因为
++ * 每个中间态触发一次查询。
++ */
++public final class ImeCompositionTest {
++    @Rule public final TemporaryFolder temporary = new TemporaryFolder();
++
++    @Test
++    public void compositionCountsAsContentWithoutTouchingText() throws Exception {
++        withScene((view, player) -> {
++            TextInput input = searchInput(view);
++            assertNotNull("search field input", input);
++            assertEquals("", input.text());
++
++            input.preeditText.set("nihao");
++            input.preeditCursor.set(5);
++            settle(view);
++
++            assertEquals("composition must not reach text", "", input.text());
++            assertEquals("nihao", input.preeditText.peek());
++            assertTrue("the field must render as filled while composing",
++                    fieldContentFlag(view));
++
++            input.preeditText.set("");
++            input.preeditCursor.set(0);
++            settle(view);
++
++            assertFalse("clearing the composition empties the field again",
++                    fieldContentFlag(view));
++        });
++    }
++
++    @Test
++    public void committedCharactersLandAfterTheCompositionIsDropped() throws Exception {
++        withScene((view, player) -> {
++            TextInput input = searchInput(view);
++            assertNotNull("search field input", input);
++
++            input.setCursorPosition(0);
++            view.setFocus(input);
++            input.preeditText.set("nihao");
++            input.preeditCursor.set(5);
++            settle(view);
++            // 宿主在 char 回调里做的事：先丢掉组合，再把提交的字符交给编辑器。
++            input.preeditText.set("");
++            view.dispatchKey(0, "你好", true);
++            settle(view);
++
++            assertEquals("你好", input.text());
++            assertEquals("", input.preeditText.peek());
++            assertEquals("caret must follow the committed run", 2, input.cursorPosition());
++        });
++    }
++
++    @Test
++    public void compositionReplacesTheSelectedText() throws Exception {
++        withScene((view, player) -> {
++            TextInput input = searchInput(view);
++            assertNotNull("search field input", input);
++            input.setText("abcdef");
++            input.setCursorPosition(6);
++            input.setSelectionRange(2, 5);
++
++            DesktopWindow.beginComposition(input);
++
++            assertEquals("the selected run is what the composition replaces",
++                    "abf", input.text());
++            assertEquals("the composing caret sits where the selection started",
++                    2, input.cursorPosition());
++            assertEquals(2, input.selectionStart());
++            assertEquals(2, input.selectionEnd());
++        });
++    }
++
++    private static boolean fieldContentFlag(QmlView view) throws Exception {
++        Item field = view.findByObjectName("searchQuery");
++        assertNotNull("searchQuery", field);
++        return (Boolean) property(field, "hasContent").peek();
++    }
++
++    private static TextInput searchInput(QmlView view) {
++        Item field = view.findByObjectName("searchQuery");
++        if (field == null) return null;
++        Item input = findIn(field, "miuixTextFieldInput");
++        return input instanceof TextInput ? (TextInput) input : null;
++    }
++
++    private void withScene(SceneCheck check) throws Exception {
++        String oldBase = AppDirs.base();
++        String oldCache = AppDirs.cacheBase();
++        PlayerController player = null;
++        QmlView view = null;
++        try {
++            Path base = temporary.newFolder().toPath();
++            AppDirs.setBase(base.toString());
++            AppDirs.setCacheBase(base.resolve("cache").toString());
++            AudioBackend backend = (AudioBackend) Proxy.newProxyInstance(
++                    AudioBackend.class.getClassLoader(), new Class<?>[]{AudioBackend.class},
++                    (proxy, method, args) -> {
++                        if (method.getReturnType() == boolean.class) return false;
++                        if (method.getReturnType() == long.class) return 0L;
++                        return null;
++                    });
++            player = new PlayerController(backend, track -> { });
++            player.sourceSetupPending.set(false);
++            SettingsCore settings = new SettingsCore();
++            settings.load(new JsonSettingsStore(), SettingsCatalog.DESKTOP);
++            ClasspathResourceLoader resources = new ClasspathResourceLoader();
++            view = QmlView.withStockTypes(new QmlEngine()).resources(resources)
++                    .context("player", player).context("settings", settings)
++                    .context("i18n", I18n.instance())
++                    .context("hostWindow", new WindowChromeStub());
++            view.load(new String(resources.load("Main.qml"), StandardCharsets.UTF_8));
++            view.root().height.set(806);
++            view.root().width.set(1100);
++            settle(view);
++            // 搜索框在惰性加载的页面上（page 1，由 searchLoaded 控制）。
++            property(view.root(), "searchLoaded").set(true);
++            property(view.root(), "page").set(1);
++            settle(view);
++            check.run(view, player);
++        } finally {
++            if (view != null) view.dispose();
++            if (player != null) {
++                try { player.shutdownAsync().join(); } catch (Throwable ignored) { }
++            }
++            AppDirs.setBase(oldBase);
++            AppDirs.setCacheBase(oldCache);
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static <T> Property<T> property(Item item, String name) throws Exception {
++        return (Property<T>) item.getClass().getField(name).get(item);
++    }
++
++    private static Item findIn(Item root, String objectName) {
++        if (objectName.equals(root.objectName.peek())) return root;
++        for (Item child : root.children) {
++            Item hit = findIn(child, objectName);
++            if (hit != null) return hit;
++        }
++        return null;
++    }
++
++    private static void settle(QmlView view) {
++        DirtyQueue queue = view.dirtyQueue();
++        queue.install();
++        try {
++            long animationStart = System.nanoTime();
++            view.tickAnimations(animationStart);
++            view.tickAnimations(animationStart + 1_000_000_000L);
++            for (int i = 0; i < 4; i++) {
++                queue.flush();
++                view.renderer().layoutOnly(view.root());
++            }
++            queue.flush();
++        } finally {
++            queue.uninstall();
++        }
++    }
++
++    @FunctionalInterface
++    private interface SceneCheck {
++        void run(QmlView view, PlayerController player) throws Exception;
++    }
++}
+diff --git a/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/ImePositioningLayoutTest.java b/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/ImePositioningLayoutTest.java
+@@ -0,0 +1,79 @@
++package dev.t1m3.qplayer.desktop.window;
++
++import org.junit.Test;
++
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++
++import static org.junit.Assert.assertEquals;
++
++/**
++ * Guards the Win32 structure layout used by {@link ImePositioner}.
++ *
++ * <p>{@code CANDIDATEFORM} starts with {@code dwIndex}; when the diagnostics
++ * declared it without that field every read-back was shifted by four bytes and
++ * reported a default candidate position that imm32 never held. These assertions
++ * pin the layout to the MSVC one so the mistake cannot come back unnoticed.
++ */
++public class ImePositioningLayoutTest {
++
++    private static ByteBuffer bytes(com.sun.jna.Structure s) {
++        s.write();
++        byte[] raw = s.getPointer().getByteArray(0, s.size());
++        return ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN);
++    }
++
++    @Test
++    public void candidateFormMatchesMsvcLayout() {
++        ImePositioner.CANDIDATEFORM f = new ImePositioner.CANDIDATEFORM();
++        f.dwIndex = 0x11223344;
++        f.dwStyle = 0x55667788;
++        f.ptCurrentPos.x = 0x0A0B0C0D;
++        f.ptCurrentPos.y = 0x01020304;
++        f.rcArea.left = 11;
++        f.rcArea.top = 12;
++        f.rcArea.right = 13;
++        f.rcArea.bottom = 14;
++
++        ByteBuffer b = bytes(f);
++        // DWORD dwIndex, DWORD dwStyle, POINT, RECT -- no padding on x64.
++        assertEquals(32, f.size());
++        assertEquals(0x11223344, b.getInt(0));
++        assertEquals(0x55667788, b.getInt(4));
++        assertEquals(0x0A0B0C0D, b.getInt(8));
++        assertEquals(0x01020304, b.getInt(12));
++        assertEquals(11, b.getInt(16));
++        assertEquals(12, b.getInt(20));
++        assertEquals(13, b.getInt(24));
++        assertEquals(14, b.getInt(28));
++    }
++
++    @Test
++    public void compositionFormMatchesMsvcLayout() {
++        ImePositioner.COMPOSITIONFORM f = new ImePositioner.COMPOSITIONFORM();
++        f.dwStyle = 0x00000001;
++        f.ptCurrentPos.x = 21;
++        f.ptCurrentPos.y = 22;
++        f.rcArea.left = 23;
++        f.rcArea.top = 24;
++        f.rcArea.right = 25;
++        f.rcArea.bottom = 26;
++
++        ByteBuffer b = bytes(f);
++        // DWORD dwStyle, POINT at offset 4, RECT at offset 12.
++        assertEquals(28, f.size());
++        assertEquals(1, b.getInt(0));
++        assertEquals(21, b.getInt(4));
++        assertEquals(22, b.getInt(8));
++        assertEquals(23, b.getInt(12));
++        assertEquals(24, b.getInt(16));
++        assertEquals(25, b.getInt(20));
++        assertEquals(26, b.getInt(24));
++    }
++
++    @Test
++    public void pointAndRectAreUnpadded() {
++        assertEquals(8, new ImePositioner.POINT().size());
++        assertEquals(16, new ImePositioner.RECT().size());
++    }
++}
+diff --git a/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/WinImeTest.java b/desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/WinImeTest.java
+@@ -1,43 +0,0 @@
+-package dev.t1m3.qplayer.desktop.window;
+-
+-import org.junit.Test;
+-
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertFalse;
+-import static org.junit.Assert.assertNull;
+-import static org.junit.Assert.assertTrue;
+-
+-public class WinImeTest {
+-
+-    @Test
+-    public void imeCompositionAndCandidateNotifyAreRecognized() {
+-        assertTrue(WinIme.isImeMessage(WinIme.WM_IME_STARTCOMPOSITION));
+-        assertTrue(WinIme.isImeMessage(WinIme.WM_IME_COMPOSITION));
+-        assertTrue(WinIme.isImeMessage(WinIme.WM_IME_NOTIFY));
+-        assertTrue(WinIme.isImeMessage(WinIme.WM_IME_ENDCOMPOSITION));
+-        assertFalse(WinIme.isImeMessage(0x0084)); // WM_NCHITTEST
+-        assertFalse(WinIme.isImeMessage(0x0005)); // WM_SIZE
+-        assertFalse(WinIme.isImeMessage(WinIme.WM_IME_REQUEST));
+-    }
+-
+-    @Test
+-    public void candidateNotifyFromImmSetIsNotWrittenAgain() {
+-        assertTrue(WinIme.shouldPlace(WinIme.WM_IME_STARTCOMPOSITION, 0));
+-        assertTrue(WinIme.shouldPlace(WinIme.WM_IME_COMPOSITION, 0));
+-        assertTrue(WinIme.shouldPlace(WinIme.WM_IME_NOTIFY, WinIme.IMN_OPENCANDIDATE));
+-        assertFalse(WinIme.shouldPlace(WinIme.WM_IME_NOTIFY, 0x0009));
+-        assertFalse(WinIme.shouldPlace(WinIme.WM_IME_ENDCOMPOSITION, 0));
+-    }
+-
+-    @Test
+-    public void imeRequestWithoutAFieldIsLeftToTheSystem() {
+-        assertNull(WinIme.answerImeRequest(WinIme.IMR_CANDIDATEWINDOW, 0x1000, null));
+-        assertEquals(32, new WinIme.CANDIDATEFORM().size());
+-        assertEquals(28, new WinIme.COMPOSITIONFORM().size());
+-    }
+-
+-    @Test
+-    public void missingGeometryDoesNotPlaceACandidateWindow() {
+-        assertTrue(WinIme.boxFromItem(null, null, 1f) == null);
+-    }
+-}
+diff --git a/shared-qml/miuix/Core/TextField.qml b/shared-qml/miuix/Core/TextField.qml
+@@ -33,7 +33,9 @@ Item {
+     property color labelColor: Theme.color.onSecondaryContainerColor
+     property color borderColor: error ? Theme.color.error : Theme.color.primary
+     readonly property bool focused: input.activeFocus
+-    readonly property bool hasContent: text.length > 0
++    // 本地改动（框内预编辑）：组合串也算有内容——编辑器把拼音画在框里，此时还留着
++    // 标签或占位符会压在它下面。
++    readonly property bool hasContent: text.length > 0 || input.preeditText.length > 0
+     readonly property bool isFloating: label.length > 0 && hasContent && !useLabelAsPlaceholder
+     readonly property real fieldHeight: Math.max(56, verticalPadding * 2 + 24)
+     readonly property real _lineY: (fieldHeight - 24) / 2
