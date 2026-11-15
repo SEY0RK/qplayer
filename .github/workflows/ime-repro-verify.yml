@@ -53,6 +53,14 @@ jobs:
       - name: Compile desktop-host IME sources
         run: mvn -B -Dmaven.test.skip=true -pl desktop-host compile
 
+      - name: Validate all workflow YAML files
+        run: |
+          python -m pip install --quiet pyyaml
+          python -c "import yaml, glob; fs=glob.glob('.github/workflows/*.yml'); [yaml.safe_load(open(f, encoding='utf-8')) for f in fs]; print('workflow YAML OK:', fs)"
+
+      - name: Verify IME baseline guard
+        run: python .github/scripts/verify-ime-baseline.py
+
       - name: Assert both IME implementations are present
         run: |
           test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/ImeBridge.class

@@ -1,0 +1,33 @@
+{
+  "positive": [
+    "desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImePositioner.java",
+    "desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImeDiagnostics.java",
+    "desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImeBridge.java",
+    "desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/DesktopWindow.java",
+    "desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/WinFrameless.java",
+    "desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/InputBridge.java",
+    "desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/WinIme.java",
+    "desktop-host/pom.xml",
+    "shared-qml/miuix/Core/TextField.qml",
+    "shared-qml/Main.qml",
+    "player-core/src/main/java/dev/t1m3/qplayer/bridge/PlayerController.java"
+  ],
+  "negative": [
+    "desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/ImeCandidateRectTest.java",
+    "desktop-host/src/test/java/dev/t1m3/qplayer/desktop/window/ImeCandidateRepositionTest.java",
+    "shared-qml/components/ImeCandidateBar.qml"
+  ],
+  "forbidden_content": {
+    "shared-qml/Main.qml": [
+      "ImeCandidateBar",
+      "imeAnchorX"
+    ],
+    "player-core/src/main/java/dev/t1m3/qplayer/bridge/PlayerController.java": [
+      "imeCandidates",
+      "imeAnchorX"
+    ]
+  },
+  "engine_repo": "SEY0RK/qml4j-ime",
+  "engine_ref": "v0.2.39-ime",
+  "engine_version": "v0.2.39"
+}

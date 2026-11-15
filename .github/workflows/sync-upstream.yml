@@ -1,0 +1,55 @@
+name: sync-upstream
+# Manual only. A GitHub fork NEVER syncs automatically.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Upstream tag to merge (blank = newest v* tag)
+        required: false
+        default: ''
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, ref: local-v2 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.13' }
+      - name: Configure upstream and fetch tags
+        run: |
+          git remote add upstream https://github.com/TIMER-err/qplayer.git || true
+          git fetch upstream --tags --force
+      - name: Merge upstream into integration branch
+        id: merge
+        run: |
+          set -e
+          git config user.name qplayer-local
+          git config user.email qplayer-local@localhost
+          git checkout -B integration local-v2
+          ref="${{ inputs.upstream_tag }}"
+          if [ -z "$ref" ]; then ref=$(git tag --list 'v*' --sort=-v:refname | head -1); fi
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+          if ! git merge --no-edit "$ref"; then
+            echo "::error::merge conflict - open a PR manually, never auto-merge into local"
+            exit 2
+          fi
+      - name: IME guard (must pass before any merge into local)
+        run: python .github/scripts/verify-ime-baseline.py
+      - name: Push integration and open PR
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.merge.outputs.tag }}
+        run: |
+          git push -f origin integration
+          gh pr create --base local-v2 --head integration --title "Upstream sync: $TAG (IME guard passed)" --body "Manual sync. IME baseline verified; review before merging into local." || true
+      - name: Report failure as issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.merge.outputs.tag }}
+        run: gh issue create --title "Upstream sync $TAG needs manual attention" --body "Merge conflict or IME guard failure. local-v2 was NOT modified." || true

@@ -1,0 +1,11 @@
+6d852e525fb5867bc65202193df34da42d6e85e9bf0610b388c6d062d38adc7c  desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImePositioner.java
+229c1259761910f7543aa11081ced9ef7ae74d20a62d067587aadfac42d46064  desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImeDiagnostics.java
+5cab22aac5123875aaaaa4cf374c6697472b679d45b0d104ad062b83e8689e7b  desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/ImeBridge.java
+33eae77e8c8080cd253d91cdaefd40c4a1ae2591c2e2afd0eb1ab07c4e0e06b0  desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/DesktopWindow.java
+5243942147e25e9dce696402d8b71a9baa8c0e0d8063d7173672e4f0e6319219  desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/WinFrameless.java
+756323c11d2a39484780cec6bfba30ebd6e730c6677db38d75fe25ae401c7653  desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/InputBridge.java
+0d567c878dede3a89390c7ec6776f686837211dc353d1a73241fd954859e95e1  desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/WinIme.java
+a9165fc903b205fa6d37ec430bb7838aa3d8c0e62dd65eb9adf293c40481a5d8  desktop-host/pom.xml
+b8fedd21e15b36e0a6dbece74e238f3be53b4fec254097d5a4eec559da24da07  shared-qml/miuix/Core/TextField.qml
+e0191ecfc4c53a7c426c4b8393ff59469a0d7d71eca1f183ece8ae113783c75d  shared-qml/Main.qml
+075b1b3a80f5054c2c63c2c6a2d4988804ec561783ec79270c841283d1af8696  player-core/src/main/java/dev/t1m3/qplayer/bridge/PlayerController.java
