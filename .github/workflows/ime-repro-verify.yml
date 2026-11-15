@@ -66,6 +66,12 @@ jobs:
       - name: Verify IME baseline guard
         run: python .github/scripts/verify-ime-baseline.py
 
+      - name: Compile Android perf variant
+        if: contains(github.event.head_commit.message, 'gradle-verify')
+        run: |
+          chmod +x android-shell/gradlew
+          cd android-shell && ./gradlew --no-daemon :app:assemblePerf
+
       - name: Assert both IME implementations are present
         run: |
           test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/ImeBridge.class
