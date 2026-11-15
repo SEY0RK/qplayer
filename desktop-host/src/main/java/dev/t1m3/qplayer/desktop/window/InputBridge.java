@@ -4,6 +4,7 @@ import io.github.timer_err.qml4j.render.QmlView;
 import io.github.timer_err.qml4j.render.items.core.Item;
 import io.github.timer_err.qml4j.render.items.core.MouseEvent;
 import io.github.timer_err.qml4j.render.items.input.TextEditable;
+import io.github.timer_err.qml4j.render.items.input.TextInput;
 
 import dev.t1m3.qplayer.bridge.PlayerController;
 import dev.t1m3.qplayer.lyric.skia.LyricCompositor;
@@ -119,6 +120,10 @@ final class InputBridge {
                 }
                 return;
             }
+            // 本地改动（框内预编辑）：组合进行中输入法自己掌管导航键与提交键。Windows
+            // 会把被它吃掉的键报成 VK_PROCESSKEY，但它放过来的那些（Esc 取消、方向键
+            // 移动组合光标）不能同时又落到编辑器或返回键上。
+            if (win.imeComposing() && isCompositionKey(key)) return;
             // Text-editing shortcuts: Ctrl (Win/Linux) or Cmd (macOS) + A/C/X/V. The
             // engine exposes copy/cut/paste as explicit calls (not part of dispatchKey)
             // and has no select-all at all, so the host must route the accelerators —
@@ -184,7 +189,11 @@ final class InputBridge {
             final String s = new String(Character.toChars(codepoint));
             win.postRenderTask(() -> {
                 QmlView v = win.view();
-                if (v != null && !s.isEmpty()) v.dispatchKey(0, s, true);
+                if (v == null || s.isEmpty()) return;
+                // 本地改动：提交的字符到达时组合串还在（输入法随后才清），所以先
+                // 把组合清掉——否则结果会落在拼音中间。
+                win.clearImePreedit();
+                v.dispatchKey(0, s, true);
             });
         });
         // Same path as Settings → 从文件导入: a dropped .qplug opens the
@@ -261,6 +270,48 @@ final class InputBridge {
     void tick() {
         tickFullscreenExitHold();
         tickScroll();
+        trackImeCaret();
+    }
+
+    /** 本地改动：每帧把组合光标那一列喂给输入法。
+     *
+     *  <p>候选窗要贴着这个矩形摆并避开它，所以必须是光标自己那一列而不是整个输入框：
+     *  给整框的矩形会把候选窗钉在框外面，而不是正在输入的字符下面。
+     *  {@code preeditCaretX} 由编辑器的绘制写入——只有绘制量得出组合串的宽度。 */
+    private void trackImeCaret() {
+        QmlView v = win.view();
+        Item f = v == null ? null : v.focused();
+        if (!(f instanceof TextInput) || !f.isVisible()) {
+            win.clearImePreedit();
+            return;
+        }
+        TextInput input = (TextInput) f;
+        float[] rect = caretRect(f);
+        win.setImeCursorRectangle(rect[0] + input.preeditCaretX, rect[1],
+                1f, rect[3] - rect[1]);
+    }
+
+    /** 输入框在场景坐标里的外框 [left, top, right, bottom]，逐层累加父节点偏移。 */
+    static float[] caretRect(Item focused) {
+        float x = 0f;
+        float y = 0f;
+        Item it = focused;
+        for (int depth = 0; it != null && depth < 64; depth++) {
+            x += it.x.peekFloat();
+            y += it.y.peekFloat();
+            it = it.parent.peek();
+        }
+        return new float[]{x, y, x + focused.width.peekFloat(), y + focused.height.peekFloat()};
+    }
+
+    /** 组合进行中输入法掌管的键。 */
+    private static boolean isCompositionKey(int key) {
+        return key == GLFW.GLFW_KEY_BACKSPACE || key == GLFW.GLFW_KEY_DELETE
+                || key == GLFW.GLFW_KEY_LEFT || key == GLFW.GLFW_KEY_RIGHT
+                || key == GLFW.GLFW_KEY_UP || key == GLFW.GLFW_KEY_DOWN
+                || key == GLFW.GLFW_KEY_HOME || key == GLFW.GLFW_KEY_END
+                || key == GLFW.GLFW_KEY_ENTER || key == GLFW.GLFW_KEY_ESCAPE
+                || key == GLFW.GLFW_KEY_SPACE || key == GLFW.GLFW_KEY_TAB;
     }
 
     private void tickFullscreenExitHold() {

@@ -18,7 +18,10 @@
         <!-- Java 17 source; JVM development uses JDK 21+, Native Image uses GraalVM 25.
              Keep the Android-shared player-core on Java 8. -->
         <maven.compiler.release>17</maven.compiler.release>
-        <lwjgl.version>3.3.3</lwjgl.version>
+        <!-- 本地偏离：上游用 3.3.3；框内预编辑要用 GLFW 3.5 的 IME 实现
+             （glfwSetPreeditCallback / GLFW_IME / glfwSetPreeditCursorRectangle），
+             它只在 LWJGL 3.4.x 里绑定了。 -->
+        <lwjgl.version>3.4.3</lwjgl.version>
         <!-- The native classifiers for THIS build host. Defaults target Linux x64;
              the os-activated profiles below flip them for Windows / macOS (intel &
              apple-silicon). Native Image cannot cross-build, so each platform's
@@ -147,46 +150,12 @@
                             </arguments>
                         </configuration>
                     </execution>
-                    <execution>
-                        <id>configure-native-webview</id>
-                        <phase>generate-resources</phase>
-                        <goals><goal>exec</goal></goals>
-                        <configuration>
-                            <executable>cmake</executable>
-                            <environmentVariables><JAVA_HOME>${java.home}</JAVA_HOME></environmentVariables>
-                            <arguments combine.self="override">
-                                <argument>-S</argument><argument>${project.basedir}/native/webview</argument>
-                                <argument>-B</argument><argument>${project.build.directory}/webview-native</argument>
-                                <argument>-DCMAKE_BUILD_TYPE=Release</argument>
-                                <argument>-DCMAKE_INSTALL_PREFIX=${project.build.outputDirectory}</argument>
-                            </arguments>
-                        </configuration>
-                    </execution>
-                    <execution>
-                        <id>build-native-webview</id>
-                        <phase>generate-resources</phase>
-                        <goals><goal>exec</goal></goals>
-                        <configuration>
-                            <executable>cmake</executable>
-                            <arguments combine.self="override">
-                                <argument>--build</argument><argument>${project.build.directory}/webview-native</argument>
-                                <argument>--config</argument><argument>Release</argument>
-                                <argument>--parallel</argument><argument>2</argument>
-                            </arguments>
-                        </configuration>
-                    </execution>
-                    <execution>
-                        <id>install-native-webview</id>
-                        <phase>generate-resources</phase>
-                        <goals><goal>exec</goal></goals>
-                        <configuration>
-                            <executable>cmake</executable>
-                            <arguments combine.self="override">
-                                <argument>--install</argument><argument>${project.build.directory}/webview-native</argument>
-                                <argument>--config</argument><argument>Release</argument>
-                            </arguments>
-                        </configuration>
-                    </execution>
+                    <!-- 本地偏离：上游在这里用 cmake 编译 native/webview 的原生 WebView2 组件。
+                         本机不安装 CMake/MSVC（哥的要求：不再下载新工具），改为直接把
+                         v1.9.8 官方发布包里同一个 qplayerwebview.dll 放在
+                         src/main/resources/native-webview/ 下，随 jar 一起打包。
+                         恢复上游构建链时，把这三段 configure/build/install-native-webview
+                         原样贴回并删掉该 dll 即可。 -->
                     <execution>
                         <id>native-host-metadata</id>
                         <phase>process-classes</phase>
@@ -421,9 +390,11 @@
                         <groupId>org.codehaus.mojo</groupId>
                         <artifactId>exec-maven-plugin</artifactId>
                         <executions>
+                            <!-- 本地偏离：这一段只为 GraalVM 原生链接生成 .res（需要 rc.exe）。
+                                 JVM 绿色版打包不需要（版本信息由启动器脚本提供），故停用。 -->
                             <execution>
                                 <id>windows-executable-resources</id>
-                                <phase>generate-resources</phase>
+                                <phase>none</phase>
                                 <goals><goal>exec</goal></goals>
                                 <configuration>
                                     <executable>powershell</executable>

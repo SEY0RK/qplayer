@@ -33,7 +33,9 @@ Item {
     property color labelColor: Theme.color.onSecondaryContainerColor
     property color borderColor: error ? Theme.color.error : Theme.color.primary
     readonly property bool focused: input.activeFocus
-    readonly property bool hasContent: text.length > 0
+    // 本地改动（框内预编辑）：组合串也算有内容——编辑器把拼音画在框里，此时还留着
+    // 标签或占位符会压在它下面。
+    readonly property bool hasContent: text.length > 0 || input.preeditText.length > 0
     readonly property bool isFloating: label.length > 0 && hasContent && !useLabelAsPlaceholder
     readonly property real fieldHeight: Math.max(56, verticalPadding * 2 + 24)
     readonly property real _lineY: (fieldHeight - 24) / 2

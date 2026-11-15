@@ -591,6 +591,41 @@ public final class PlayerController {
     public final Property<List<SearchRow>> searchRows = new Property<>(Collections.<SearchRow>emptyList());
     /** SearchPage's type filter: song, album, artist or playlist. */
     public final Property<String> searchMode = new Property<>("song");
+    /** SearchPage's source filter — which providers' results {@link #searchRows}
+     *  shows. {@value #SEARCH_SCOPE_ALL} (default) keeps the aggregated list every
+     *  enabled source contributes to; any other value is a provider id and narrows
+     *  the list to that one source.
+     *
+     *  <p>This is a <em>view</em> filter, not a re-query: the search still runs
+     *  against every enabled provider and {@link #rebuildSearchRows} still merges
+     *  them in stable provider order — switching scope only hides rows. That matters
+     *  because re-querying would need a fresh round of network calls just to switch
+     *  back to "all", and would leave {@link #pluginSearchByProvider} missing the
+     *  buckets that {@link #searchRows}' row indices point into.
+     *
+     *  <p>Setting it is therefore cheap and synchronous: no network, no debounce. */
+    public final Property<String> searchScope = new Property<>(SEARCH_SCOPE_ALL);
+    /** {@link #searchScope} value meaning "every enabled source". */
+    public static final String SEARCH_SCOPE_ALL = "all";
+    /** Source-filter chips for SearchPage, as display labels:
+     *  {@code ["全部音源", "网易云", "哔哩哔哩", ...]}. Derived from the buckets
+     *  {@link #pluginSearchByProvider} actually filled, so QML never keeps its own
+     *  provider list that could drift out of sync with them.
+     *
+     *  <p>A Property rather than a getter because qml4j binds QML to Property reads;
+     *  a plain method call would only be re-evaluated when some unrelated property
+     *  happened to change. */
+    public final Property<List<String>> searchScopeTabs =
+            new Property<>(Collections.<String>emptyList());
+    /** Provider ids parallel to {@link #searchScopeTabs}; index 0 is
+     *  {@value #SEARCH_SCOPE_ALL}. QML passes {@code searchScopeIds[i]} straight to
+     *  {@link #setSearchScope(String)} on a chip tap. */
+    public final Property<List<String>> searchScopeIds =
+            new Property<>(Collections.<String>emptyList());
+    /** Index of the active chip, mirroring {@link #searchScope} into
+     *  {@link #searchScopeIds} — lets QML drive {@code TabRow.selectedTabIndex}
+     *  without mapping id to index itself. */
+    public final Property<Integer> searchScopeIndex = new Property<>(0);
     public final Property<List<NeteaseAlbum>> searchAlbumResults = new Property<>(Collections.<NeteaseAlbum>emptyList());
     public final Property<List<NeteaseArtist>> searchArtistResults = new Property<>(Collections.<NeteaseArtist>emptyList());
     public final Property<List<Album>> sourceSearchAlbumResults =
@@ -601,6 +636,16 @@ public final class PlayerController {
             new Property<>(Collections.<Playlist>emptyList());
     /** Successful page batches trigger viewport refill even when deduplication adds no rows. */
     public final Property<Long> searchPlaylistPageRevision = new Property<>(0L);
+    /**
+     * 本地改动：当前有没有音源能搜歌单。
+     *
+     * <p>歌单搜索在 v1.9.8 里完全靠插件声明 {@link ProviderCapability#SEARCH_PLAYLISTS}，
+     * 宿主自己没有任何内置实现。旧的插件（1.8.x 那批）都没这个方法，于是
+     * {@code searchPlaylists} 找不到任何音源、一条请求都不发，界面就剩一片空白 —— 看起来
+     * 像"搜不到歌单"，实际是"根本没人能搜"。这个 Property 让 SearchPage 能把两种情况
+     * 分开说清楚：没有音源支持时提示去更新插件，有音源但没命中时提示换个词。
+     */
+    public final Property<Boolean> playlistSearchSupported = new Property<>(false);
     /** Local-library matches for the same query text, shown alongside searchResults. */
     public final Property<List<Track>> localSearchResults = new Property<>(Collections.<Track>emptyList());
     /** Hot search keywords shown when search input is empty. */
@@ -3837,6 +3882,20 @@ public final class PlayerController {
     }
 
     /**
+     * 本地改动：默认不再检查官方更新。
+     *
+     * <p>这个分支是本地修改版（JVM 打包的桌面版 / 加了本地改动的安卓包），
+     * 官方发布的资产我们既装不上、也不该装——桌面版官方是 GraalVM 原生 exe + 原生
+     * WebView2 组件，安卓版是另一套签名。真让用户点了「更新」，轻则下载一个装不了的包，
+     * 重则覆盖掉本地改动。所以启动时的静默检查直接不发请求，设置页手动点「检查更新」
+     * 也只回一句「已是最新版」。
+     *
+     * <p>想恢复官方行为，加 JVM 参数 {@code -Dqplayer.update.check=true} 即可。
+     */
+    private static final boolean UPDATE_CHECK_ENABLED =
+            Boolean.parseBoolean(System.getProperty("qplayer.update.check", "false"));
+
+    /**
      * Silent (startup) check — no feedback when already up to date or on failure, only the update
      * dialog when a newer release is actually found.
      */
@@ -3868,6 +3927,12 @@ public final class PlayerController {
     public void checkForUpdate(boolean manual) {
         synchronized (QmlRuntimeLock.MONITOR) {
             if (appShuttingDown) return;
+            // 本地改动：默认不检查更新（见 UPDATE_CHECK_ENABLED）。
+            // 手动点击仍给一句反馈，否则按钮看起来像坏的。
+            if (!UPDATE_CHECK_ENABLED) {
+                if (manual) showToast(I18n.tr("toast.update.upToDate"));
+                return;
+            }
             String version = currentVersion;
             boolean mirror = updateMirror;
             AssetMatcher matcher = assetMatcher;
@@ -5188,6 +5253,15 @@ public final class PlayerController {
         void open(java.util.function.Consumer<String> onPicked);
         /** Choose where to write, seeded with {@code suggestedFileName}. */
         void save(String suggestedFileName, java.util.function.Consumer<String> onPicked);
+
+        /** 本地改动（安卓 SAF）：写入 {@code path} 结束后回调，成功与失败都调。
+         *
+         *  <p>直接给出真实目标路径的宿主不需要实现——文件已经在用户指定的位置。
+         *  只能给出暂存路径的宿主需要它：安卓的 Storage Access Framework 返回的是
+         *  {@code content://} Uri 而不是文件系统路径，宿主拿到暂存文件后再发布到用户
+         *  真正选定的位置，无论成败都要清掉暂存副本。 */
+        default void written(String path, boolean success) {
+        }
     }
 
     private volatile PlaylistFileBridge playlistFiles;
@@ -5220,8 +5294,11 @@ public final class PlayerController {
                             bridge.save(
                                     suggested,
                                     path ->
-                                            worker.submit(
+                                            // 本地改动：导出是本地文件写入，不排到网络队列
+                                            // （worker 遇到不可达主机会堵满整个 TCP 超时）。
+                                            ioWorker.submit(
                                                     () -> {
+                                                        boolean written = false;
                                                         try {
                                                             String json =
                                                                     PlaylistTransfer.export(
@@ -5232,6 +5309,7 @@ public final class PlayerController {
                                                             StorageFiles.writeUtf8Atomic(
                                                                     java.nio.file.Paths.get(path),
                                                                     json);
+                                                            written = true;
                                                             post(
                                                                     () ->
                                                                             showToast(
@@ -5250,7 +5328,20 @@ public final class PlayerController {
                                                                                     I18n.tr(
                                                                                             "toast.localPlaylist.exportFailed")));
                                                         }
+                                                        // 放最后：宿主若要把暂存文件发布出去，
+                                                        // 也是在成功/失败提示入队之后，不会挡住写入。
+                                                        notifyPlaylistWritten(bridge, path, written);
                                                     })));
+        }
+    }
+
+    /** 把写完（或写失败）的导出结果交回宿主桥。宿主侧出错不能影响已经完成的导出。 */
+    private static void notifyPlaylistWritten(
+            PlaylistFileBridge bridge, String path, boolean success) {
+        try {
+            bridge.written(path, success);
+        } catch (Throwable error) {
+            Logger.warn("playlist write notification failed: {}", error.getMessage());
         }
     }
 
@@ -5265,7 +5356,8 @@ public final class PlayerController {
                     () ->
                             bridge.open(
                                     path ->
-                                            worker.submit(
+                                            // 本地改动：导入同样是本地文件读取，走 ioWorker。
+                                            ioWorker.submit(
                                                     () -> {
                                                         try {
                                                             String json =
@@ -7258,7 +7350,14 @@ public final class PlayerController {
                 pluginSearchCursors.put(provider.id, "");
                 cursors.put(provider.id, "");
             }
-            if (!cursors.isEmpty()) searchPlaylistPages(cursors);
+            // 本地改动：把「有没有音源能搜歌单」告诉 QML。空集时下面一条请求都不会发，
+            // 列表永远是空的；不带上这个标记，界面就只是一片没有任何说明的空白。
+            playlistSearchSupported.set(!cursors.isEmpty());
+            if (!cursors.isEmpty()) {
+                searchPlaylistPages(cursors);
+            } else {
+                Logger.info("no enabled provider advertises searchPlaylists; playlist search skipped");
+            }
         }
     }
 
@@ -7474,6 +7573,15 @@ public final class PlayerController {
             pluginProviderNames.put(manifest.id, manifest.name);
             pluginSearchCursors.put(manifest.id, "");
         }
+        // The scope is a user preference and survives a new query, but the provider
+        // it names may have been disabled since. Reset to "all" in that case so the
+        // results list is never filtered down to a source that no longer exists
+        // (which would render as an empty page while the query clearly matched).
+        String scope = searchScope.peek();
+        if (scope != null && !scope.isEmpty() && !SEARCH_SCOPE_ALL.equals(scope)
+                && !pluginSearchByProvider.containsKey(scope)) {
+            searchScope.set(SEARCH_SCOPE_ALL);
+        }
         rebuildSearchRows();
         if (providers.isEmpty()) return false;
         searchLoading.set(true);
@@ -7578,8 +7686,25 @@ public final class PlayerController {
      * #searchAlbumResults}/{@link #searchArtistResults}, bypassing this list. */
     void rebuildSearchRows() {
         List<SearchRow> rows = new ArrayList<>();
+
+        // Source scope (SearchPage's source filter). "all" keeps every source; a
+        // provider id narrows the list to that one. Read once per rebuild so a
+        // concurrent scope change can't produce a half-filtered list.
+        //
+        // This only decides what is *shown*. row.index must still be the index
+        // inside its own source list, because playPluginSearchResult resolves the
+        // song through pluginSearchByProvider.get(providerId).get(index) — filtering
+        // must not renumber anything.
+        final String scope = searchScope.peek();
+        final boolean allSources = scope == null || scope.isEmpty()
+                || SEARCH_SCOPE_ALL.equals(scope);
+        // Local files are not an online source, so a single-source scope hides them
+        // too: the user asked to see one source, and "本地" is not it.
+        final boolean includeLocal = allSources;
+        final boolean includeLegacyNetease = allSources || "netease".equals(scope);
+
         List<NeteaseSong> ns = searchResults.peek();
-        if (ns != null) {
+        if (includeLegacyNetease && ns != null) {
             for (int i = 0; i < ns.size(); i++) {
                 NeteaseSong s = ns.get(i);
                 SearchRow row = new SearchRow();
@@ -7614,6 +7739,7 @@ public final class PlayerController {
         }
         for (int rank = 0; rank < deepest; rank++) {
             for (Map.Entry<String, List<Song>> provider : pluginSearchByProvider.entrySet()) {
+                if (!allSources && !provider.getKey().equals(scope)) continue;
                 List<Song> songs = provider.getValue();
                 if (songs == null || rank >= songs.size()) continue;
                 Song song = songs.get(rank);
@@ -7634,7 +7760,7 @@ public final class PlayerController {
             }
         }
         List<Track> ls = localSearchResults.peek();
-        if (ls != null) {
+        if (includeLocal && ls != null) {
             for (int i = 0; i < ls.size(); i++) {
                 Track t = ls.get(i);
                 SearchRow row = new SearchRow();
@@ -7651,6 +7777,69 @@ public final class PlayerController {
         }
         searchRows.set(rows);
         if ("song".equals(searchMode.peek())) resultCount.set(rows.size());
+        rebuildSearchScopeTabs();
+    }
+
+    /** Refresh the source-filter chips ({@link #searchScopeTabs} /
+     *  {@link #searchScopeIds} / {@link #searchScopeIndex}).
+     *
+     *  <p>Runs at the end of {@link #rebuildSearchRows()} so the chips always name
+     *  exactly the buckets that exist. Only one source (or none) means there is
+     *  nothing to switch between, so the chips collapse to an empty list and
+     *  SearchPage hides the row entirely. */
+    private void rebuildSearchScopeTabs() {
+        Set<String> providers = pluginSearchByProvider.keySet();
+        if (providers.size() <= 1) {
+            if (!searchScopeTabs.peek().isEmpty()) {
+                searchScopeTabs.set(Collections.<String>emptyList());
+                searchScopeIds.set(Collections.<String>emptyList());
+                searchScopeIndex.set(0);
+            }
+            return;
+        }
+
+        List<String> ids = new ArrayList<>(providers.size() + 1);
+        List<String> labels = new ArrayList<>(providers.size() + 1);
+        ids.add(SEARCH_SCOPE_ALL);
+        labels.add(I18n.tr("search.scope.all"));
+        for (String providerId : providers) {
+            ids.add(providerId);
+            labels.add(pluginProviderNames.getOrDefault(providerId, providerId));
+        }
+
+        // A scope that no longer has a bucket (provider disabled mid-session) is
+        // reported as "all" — both here and in rebuildSearchRows, so the chip and
+        // the list can never disagree.
+        String scope = searchScope.peek();
+        int index = ids.indexOf(scope == null || scope.isEmpty() ? SEARCH_SCOPE_ALL : scope);
+        if (index < 0) {
+            index = 0;
+            searchScope.set(SEARCH_SCOPE_ALL);
+        }
+
+        searchScopeTabs.set(Collections.unmodifiableList(labels));
+        searchScopeIds.set(Collections.unmodifiableList(ids));
+        searchScopeIndex.set(index);
+    }
+
+    /** SearchPage's source filter. {@value #SEARCH_SCOPE_ALL} restores the
+     *  aggregated list; a provider id narrows it to that source.
+     *
+     *  <p>No network work happens here and no debounce is needed: the per-provider
+     *  results are already in {@link #pluginSearchByProvider}, so this is a pure
+     *  view change. Unknown ids fall back to "all" rather than showing an empty
+     *  list — a source can be disabled between renders, and an empty page with no
+     *  explanation is the worst outcome. */
+    public void setSearchScope(String scope) {
+        String next = scope == null ? "" : scope.trim();
+        if (next.isEmpty()) next = SEARCH_SCOPE_ALL;
+        if (!SEARCH_SCOPE_ALL.equals(next)
+                && !pluginSearchByProvider.containsKey(next)) {
+            Logger.info("search scope {} is not an active provider, falling back to all", next);
+            next = SEARCH_SCOPE_ALL;
+        }
+        searchScope.set(next);
+        rebuildSearchRows();
     }
 
     /**

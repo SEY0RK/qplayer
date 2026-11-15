@@ -70,7 +70,7 @@ Item {
         // page instead of asking the inner layout to distribute width.
         Item {
             Layout.fillWidth: true
-            Layout.preferredHeight: 134
+            Layout.preferredHeight: player.searchMode === "song" && player.searchScopeTabs.length > 1 ? 180 : 134
             TextField {
                 id: query
                 objectName: "searchQuery"
@@ -104,6 +104,32 @@ Item {
                 onTabSelected: (index) => {
                     player.setSearchMode(["song", "album", "artist", "playlist"][index])
                     if (query.text.length > 0) page.runSearchNow()
+                }
+            }
+
+            // 本地改动：音源筛选。在「全部」聚合列表和任一单个音源的结果之间切换。
+            // 宿主报告的音源数少于 2 个时整条隐藏——只有一个音源（或没有）就没有
+            // 可筛的东西，只显示一个「全部音源」反而是噪音。
+            //
+            // 只在歌曲模式下有意义：专辑/歌手/歌单结果是宿主按 kind 各自维护的列表，
+            // 不像 searchRows 那样是按音源分桶的。
+            TabRowWithContour {
+                id: sourceBar
+                objectName: "searchSourceBar"
+                // 绝对定位而不是 Layout.*：外层是普通 Item（见上面那条注释），
+                // 布局附加属性在里面不生效，会把 chips 压成 0 尺寸。
+                x: 16
+                y: 130
+                width: Math.max(0, page.width - 32)
+                height: 38
+                visible: player.searchMode === "song" && player.searchScopeTabs.length > 1
+                selectedTabIndex: player.searchScopeIndex
+                tabs: player.searchScopeTabs
+                // 宿主让 id 与标签平行对应并自己掌握 id→index 的映射，所以点一下只回传
+                // id；索引由宿主重新推导（该音源中途消失时回落到「全部」）。
+                onTabSelected: (index) => {
+                    var ids = player.searchScopeIds
+                    if (index >= 0 && index < ids.length) player.setSearchScope(ids[index])
                 }
             }
         }
@@ -664,6 +690,24 @@ Item {
                     target: playlistGrid
                     bottomInset: page.bottomContentInset
                 }
+            }
+
+            // 本地改动：歌单搜索的空状态。
+            //
+            // 上游这里什么都不画：歌单搜索只依赖插件声明 searchPlaylists 能力，宿主没有
+            // 内置实现，旧插件一条都匹配不上时列表恒空，页面看起来就是"白屏"。
+            // 把两种情况分开说清楚：没有音源支持 → 提示去更新插件；有音源但没命中 → 提示换词。
+            EmptyState {
+                objectName: "searchPlaylistEmpty"
+                visible: player.searchMode === "playlist" && !player.searchLoading
+                         && playlistGrid.count === 0 && query.text.length > 0
+                icon: "music_note"
+                title: player.playlistSearchSupported
+                       ? i18n.t("search.empty.playlists")
+                       : i18n.t("search.empty.playlistsUnsupported")
+                message: player.playlistSearchSupported
+                         ? i18n.t("search.empty.playlistsHint")
+                         : i18n.t("search.empty.playlistsUnsupportedHint")
             }
         }
     }

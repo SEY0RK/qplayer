@@ -157,18 +157,9 @@ final class WinFrameless {
                 window.onNativeFramebufferResize(
                         packed & 0xFFFF, (packed >>> 16) & 0xFFFF);
             }
-            if (msg == WinIme.WM_IME_REQUEST) {
-                LRESULT answered = WinIme.answerImeRequest(
-                        wParam.intValue(), lParam.longValue(), window);
-                if (answered != null) return answered;
-            }
-            if (WinIme.isImeMessage(msg)) {
-                LRESULT result = U32.I.CallWindowProcW(originalWndProc, h, msg, wParam, lParam);
-                if (WinIme.shouldPlace(msg, wParam.intValue())) {
-                    WinIme.placeCandidateWindow(h, window);
-                }
-                return result;
-            }
+            // 候选窗 / 组合窗的位置不在这里管：ImePositioner 单独子类化窗口过程，
+            // 在 CallWindowProcW 之后写完整表单（CFS_CANDIDATEPOS + 系统 caret +
+            // CFS_EXCLUDE），是这条线程上唯一的写入者。见 ImePositioner 的类注释。
             if (msg == WM_NCCALCSIZE) return ncCalcSize(h, wParam, lParam, window);
             if (msg == WM_NCHITTEST) return hitTest(h, lParam, window, titleBarHeightLogicalPx);
             if (msg == WM_NCACTIVATE) return U32.I.DefWindowProcW(h, msg, wParam, new LPARAM(-1));

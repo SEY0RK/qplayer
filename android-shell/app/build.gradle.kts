@@ -66,7 +66,9 @@ android {
             isDebuggable = false
             matchingFallbacks += "release"
             signingConfig = signingConfigs.getByName("debug")
-            manifestPlaceholders["appLabel"] = "QPlayer (perf)"
+            // 本地改动：桌面上的显示名改成「QPlayer 本地版」，不再带 (perf) 后缀，
+            // 免得和官方包混在一起分不清。
+            manifestPlaceholders["appLabel"] = "QPlayer 本地版"
         }
     }
 

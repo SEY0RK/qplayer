@@ -4,6 +4,10 @@ import io.github.timer_err.qml4j.engine.QmlEngine;
 import io.github.timer_err.qml4j.render.QmlView;
 import io.github.timer_err.qml4j.render.ResourceLoader;
 import io.github.timer_err.qml4j.render.items.core.Item;
+// 本地改动（框内预编辑）：需要按 TextInput 的组合态写 preedit，并按 TextEditable 的
+// 选区接口在组合开始时吃掉已选中的字符。
+import io.github.timer_err.qml4j.render.items.input.TextEditable;
+import io.github.timer_err.qml4j.render.items.input.TextInput;
 
 import dev.t1m3.qplayer.bridge.PlayerController;
 import dev.t1m3.qplayer.qml.BundledQml;
@@ -130,6 +134,9 @@ public final class DesktopWindow {
     // WinFrameless is created per createWindow() call (see its own javadoc for why).
     private WindowChrome windowChrome;
     private WinFrameless frameless;
+    // 本地改动：Windows 专用输入法桥。其他平台为 null；每次 createWindow() 重建，
+    // 理由同 WinFrameless（它挂的是某一个窗口的 GLFW 回调）。
+    private ImeBridge imeBridge;
     // 确保nudgeResizeOnce只调用一次，避免从托盘恢复时累积增加窗口尺寸
     private boolean nudgeApplied = false;
     private static volatile Boolean windows11OrLater;
@@ -167,6 +174,77 @@ public final class DesktopWindow {
 
     int[] framebufferSize() {
         return new int[]{fbW, fbH};
+    }
+
+    /** 把组合光标的列交给输入法，参数是 QML 逻辑单位。
+     *
+     *  <p>每帧在渲染线程调用（只有那一线程能读 QML 几何），换算成客户区像素在
+     *  这里做完，GLFW 事件循环那边就能把数字原样交给 GLFW/imm32。窗口是无边框的，
+     *  客户端原点就是场景原点 (0,0)，唯一的换算是 DPI 缩放。 */
+    void setImeCursorRectangle(float left, float top, float width, float height) {
+        ImeBridge bridge = imeBridge;
+        if (bridge == null) return;
+        float scale = uiScale <= 0f ? 1f : uiScale;
+        bridge.setCursorRectangle(
+                Math.round(left * scale),
+                Math.round(top * scale),
+                Math.max(1, Math.round(width * scale)),
+                Math.max(1, Math.round(height * scale)));
+    }
+
+    /**
+     * 给 {@code ImePositioner} 用的原生 HWND（非 Windows 上为 null）。
+     * 窗口刚建好、{@code GLFW_IME} 还没打开时装钩子，才能从第一帧组合起
+     * 就收到每一条 {@code WM_IME_*}。
+     */
+    com.sun.jna.Pointer nativeHwnd() {
+        return nativeWindow;
+    }
+
+    /** 输入法的组合串变了。在渲染线程调用；{@code started} 标记一次组合的第一帧，
+     *  这时要先把已选中的内容吃掉，提交结果才能落在选区原来的位置。 */
+    void applyImePreedit(String text, int caret, boolean started) {
+        QmlView v = view;
+        if (v == null) return;
+        Item focused = v.focused();
+        if (!(focused instanceof TextInput)) return;
+        TextInput input = (TextInput) focused;
+        if (started) beginComposition(input);
+        input.preeditText.set(text);
+        input.preeditCursor.set(Math.max(0, Math.min(caret, text.length())));
+    }
+
+    /** 组合替换选区，跟 Qt 和浏览器的行为一致：第一个 preedit 到达之前先删掉选中
+     *  的字符，提交结果才会落在它们原来的位置。包级可见，方便不开窗口也测这条规则。 */
+    static void beginComposition(TextEditable input) {
+        int selStart = input.selectionStart();
+        int selEnd = input.selectionEnd();
+        if (selStart == selEnd) return;
+        String s = input.text();
+        if (s == null) s = "";
+        int lo = Math.max(0, Math.min(selStart, selEnd));
+        int hi = Math.min(s.length(), Math.max(selStart, selEnd));
+        if (lo < hi) {
+            input.setText(s.substring(0, lo) + s.substring(hi));
+            input.emitTextChanged();
+        }
+        input.setCursorPosition(lo);
+        input.setSelectionRange(lo, lo);
+        input.setSelectionAnchor(lo);
+    }
+
+    /** 输入法是否正握着未提交的组合串。GLFW 回调线程也会读，所以桥里那个标志是
+     *  volatile 的。 */
+    boolean imeComposing() {
+        ImeBridge bridge = imeBridge;
+        return bridge != null && bridge.composing();
+    }
+
+    /** 当前没有在编辑：把组合串丢掉，免得失焦的输入框还留着一段拼音。 */
+    void clearImePreedit() {
+        ImeBridge bridge = imeBridge;
+        if (bridge == null || !bridge.composing()) return;
+        applyImePreedit("", 0, false);
     }
 
     int refreshHz() {
@@ -834,6 +912,11 @@ public final class DesktopWindow {
         } else if (isWindows() && settings != null) {
             settings.setInsets(0, settings.bottomInset.peek());
         }
+        // 本地改动：与标题栏选择无关——不打开这一步，输入法的组合窗会开在客户区原点。
+        if (isWindows()) {
+            imeBridge = new ImeBridge();
+            imeBridge.install(this);
+        }
         if (!fullscreen) captureWindowedBounds();
         else if (!applyFullscreenMonitor()) {
             fullscreen = false;
@@ -989,6 +1072,13 @@ public final class DesktopWindow {
         stopRenderThread();
         if (window != MemoryUtil.NULL) {
             org.lwjgl.glfw.Callbacks.glfwFreeCallbacks(window);
+            // 本地改动：HWND 即将消失/替换，先销毁隐藏 caret 并恢复 GLFW 的窗口过程。
+            ImePositioner.uninstall();
+            // 本地改动：输入法桥跟着放掉。
+            if (imeBridge != null) {
+                imeBridge.dispose();
+                imeBridge = null;
+            }
             GLFW.glfwDestroyWindow(window);
             window = MemoryUtil.NULL;
         }
@@ -1135,6 +1225,11 @@ public final class DesktopWindow {
                 input.cancelFullscreenExitHold();
                 postRenderTask(input::cancelPointerGesture);
             }
+            // 本地改动：失焦时丢掉残留的组合串，重新聚焦时下一次 preedit 会重新开组合。
+            if (!foc) postRenderTask(this::clearImePreedit);
+            // 本地改动：首次聚焦后安排两轮输入上下文重连（对齐 ime-debug 版）。
+            ImeBridge bridge = imeBridge;
+            if (bridge != null) bridge.onWindowFocus(foc);
         });
         GLFW.glfwSetWindowIconifyCallback(window, (win, iconified) -> {
             windowIconified = iconified;
@@ -1287,6 +1382,13 @@ public final class DesktopWindow {
             // Block briefly so a hidden-to-tray window doesn't spin the CPU, but stay
             // responsive to tray actions posted to the main-task queue.
             GLFW.glfwWaitEventsTimeout(0.05);
+            // 本地改动：GLFW/imm32 都绑定线程，组合光标矩形只能在主线程应用，
+            // 不能交给量出这个数字的渲染线程。
+            if (imeBridge != null) {
+                imeBridge.flushCursorRectangle();
+                // 启动期输入上下文重连也是线程亲和的，一并在这里推进。
+                imeBridge.tick();
+            }
             Runnable r;
             while ((r = mainTasks.poll()) != null) {
                 try {
@@ -1348,6 +1450,13 @@ public final class DesktopWindow {
         }
         if (window != MemoryUtil.NULL) {
             org.lwjgl.glfw.Callbacks.glfwFreeCallbacks(window);
+            // 本地改动：HWND 即将消失/替换，先销毁隐藏 caret 并恢复 GLFW 的窗口过程。
+            ImePositioner.uninstall();
+            // 本地改动：输入法桥跟着放掉。
+            if (imeBridge != null) {
+                imeBridge.dispose();
+                imeBridge = null;
+            }
             GLFW.glfwDestroyWindow(window);
             window = MemoryUtil.NULL;
         }
