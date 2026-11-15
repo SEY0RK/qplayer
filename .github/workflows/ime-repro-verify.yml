@@ -2,6 +2,8 @@ name: ime-repro-verify
 # Manual only. Verifies that the Windows IME repro on local-v2 compiles
 # against the patched qml4j 0.2.39 engine.
 on:
+  push:
+    branches: [local-v2]
   workflow_dispatch:
     inputs:
       ref:
