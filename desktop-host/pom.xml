@@ -18,7 +18,7 @@
         <!-- Java 17 source; JVM development uses JDK 21+, Native Image uses GraalVM 25.
              Keep the Android-shared player-core on Java 8. -->
         <maven.compiler.release>17</maven.compiler.release>
-        <lwjgl.version>3.3.3</lwjgl.version>
+        <lwjgl.version>3.4.3</lwjgl.version>
         <!-- The native classifiers for THIS build host. Defaults target Linux x64;
              the os-activated profiles below flip them for Windows / macOS (intel &
              apple-silicon). Native Image cannot cross-build, so each platform's
