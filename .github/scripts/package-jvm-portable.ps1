@@ -34,10 +34,13 @@ $modules = @("java.base","java.desktop","java.logging","java.management","java.n
 if ($LASTEXITCODE -ne 0) { throw "jlink failed" }
 
 Write-Host "=== 4. jpackage app-image ==="
+# jpackage requires a numeric dot-separated version; Release labels may carry suffixes.
+$jpkgVersion = (($AppVersion -replace '[^0-9.]','') -split '\.' | Where-Object { $_ -match '^[0-9]+$' } | Select-Object -First 3) -join '.'
+if (-not $jpkgVersion) { $jpkgVersion = "1.9.8" }
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 $icon = Join-Path $Repo "desktop-host/src/main/resources/app-icon.ico"
 if (-not (Test-Path $icon)) { throw "missing app-icon.ico" }
-& (Join-Path $Jdk "bin/jpackage.exe") --type app-image --name QPlayer --input $stage --main-jar qplayer.jar --main-class dev.t1m3.qplayer.desktop.app.Main --runtime-image $runtime --dest $T --app-version $AppVersion --vendor "TIMER-err (local build)" --icon $icon
+& (Join-Path $Jdk "bin/jpackage.exe") --type app-image --name QPlayer --input $stage --main-jar qplayer.jar --main-class dev.t1m3.qplayer.desktop.app.Main --runtime-image $runtime --dest $T --app-version $jpkgVersion --vendor "TIMER-err (local build)" --icon $icon
 if ($LASTEXITCODE -ne 0) { throw "jpackage failed" }
 
 # Intentionally NO data/ directory: extracting this zip over an existing install
