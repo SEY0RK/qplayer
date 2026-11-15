@@ -78,6 +78,7 @@ jobs:
       - name: Install player-core
         run: |
           mvn -q -B -N install
+          mvn -q -B -DskipTests install -f qml-aot-tool/pom.xml
           mvn -q -B -DskipTests install -f player-core/pom.xml
       - name: Build perf APK (same package + same debug certificate)
         env:
