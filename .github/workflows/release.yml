@@ -80,6 +80,11 @@ jobs:
           mvn -q -B -N install
           mvn -q -B -DskipTests install -f player-core/pom.xml
       - name: Build perf APK (same package + same debug certificate)
+        env:
+          QPLAYER_PERF_KEYSTORE: ${{ github.workspace }}/.signing/debug.keystore
+          QPLAYER_PERF_STORE_PASSWORD: ${{ secrets.ANDROID_DEBUG_STORE_PASSWORD }}
+          QPLAYER_PERF_KEY_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEY_PASSWORD }}
+          QPLAYER_PERF_KEY_ALIAS: ${{ secrets.ANDROID_DEBUG_KEY_ALIAS }}
         run: |
           chmod +x android-shell/gradlew
           cd android-shell && ./gradlew --no-daemon :app:assemblePerf
@@ -112,6 +117,11 @@ jobs:
       - name: Install patched qml4j into local Maven repo
         shell: bash
         run: bash .github/scripts/install-qml4j-ime.sh
+      - name: Install Maven reactor prerequisites
+        shell: bash
+        run: |
+          mvn -q -B -N install
+          mvn -q -B -DskipTests install -f player-core/pom.xml
       - name: Build JVM portable zip (same packaging, no data dir)
         run: ./.github/scripts/package-jvm-portable.ps1 -AppVersion "${{ inputs.version || github.ref_name }}"
       - name: Verify zip contents and cfg encoding
