@@ -11,15 +11,13 @@ dependencyResolutionManagement {
         mavenLocal()
         google()
         mavenCentral()
-        exclusiveContent {
-            forRepository {
-                maven {
-                    name = "JitPack"
-                    url = uri("https://jitpack.io")
-                    mavenContent { releasesOnly() }
-                }
-            }
-            filter { includeGroup("com.github.TIMER-err.qml4j") }
+        // CI installs the locally patched qml4j into ~/.m2; mavenLocal() above
+        // must win. An exclusiveContent rule would force JitPack and silently
+        // substitute the upstream (unpatched) engine.
+        maven {
+            name = "JitPack"
+            url = uri("https://jitpack.io")
+            mavenContent { releasesOnly() }
         }
         // Fallback when repo.maven.apache.org TLS fails (common on some mainland networks).
         maven { url = uri("https://repo.huaweicloud.com/repository/maven/") }
