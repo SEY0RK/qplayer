@@ -176,6 +176,7 @@ public final class PlaylistSyncClient {
     }
 
     /** 403 is the receiver declining; the caller turns it into a friendly result. */
-    private static final class Http403 extends RuntimeException {
+    private static final class Http403 extends SyncException {
+        Http403() { super("receiver returned HTTP 403"); }
     }
 }
