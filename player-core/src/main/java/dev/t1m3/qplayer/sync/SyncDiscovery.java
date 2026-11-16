@@ -150,6 +150,7 @@ public final class SyncDiscovery {
         sender = new Thread(this::sendLoop, "qplayer-sync-discovery-tx");
         sender.setDaemon(true);
         sender.start();
+        Logger.info("sync discovery started on {} (sync port {})", DISCOVERY_PORT, syncPort);
         return true;
     }
 
@@ -226,10 +227,15 @@ public final class SyncDiscovery {
                 if (name == null || name.isEmpty()) name = id.substring(0, Math.min(8, id.length()));
                 String platform = jsonString(json, "platform");
                 String host = packet.getAddress().getHostAddress();
+                boolean isNew;
                 synchronized (lock) {
+                    isNew = !devices.containsKey(id);
                     devices.put(id, new DeviceInfo(id, name,
                             platform == null ? "" : platform, host, port,
                             System.currentTimeMillis()));
+                }
+                if (isNew) {
+                    Logger.info("sync discovery peer {} at {}:{}", name, host, port);
                 }
                 // Broadcast is often one-way on Wi-Fi: the phone can reach the
                 // PC but the PC's broadcast is filtered before it reaches the

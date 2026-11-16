@@ -71,6 +71,8 @@ public final class PlaylistSyncClient {
             throw new SyncException("invalid status response", error);
         }
         if (status == null) throw new SyncException("empty status response");
+        Logger.info("sync status {}:{} -> {} ({})", address.host, address.port,
+                status.deviceName, status.platform);
         try {
             PlaylistSyncProtocol.validateFormat(status.format, status.formatVersion);
         } catch (SyncException error) {
@@ -90,6 +92,8 @@ public final class PlaylistSyncClient {
                     PlaylistSyncProtocol.toJson(plan));
             PlaylistSyncProtocol.PlanResult result =
                     PlaylistSyncProtocol.fromJson(body, PlaylistSyncProtocol.PlanResult.class);
+            Logger.info("sync plan {}:{} -> {}", address.host, address.port,
+                    result != null && result.approved ? "approved" : "rejected");
             return result != null && result.approved;
         } catch (Http403 error) {
             return false;
@@ -113,6 +117,8 @@ public final class PlaylistSyncClient {
             throws SyncException {
         PlaylistSyncProtocol.Payload payload =
                 PlaylistSyncProtocol.payloadFor(deviceId, deviceName, snapshot);
+        Logger.info("sync apply {}:{} sending {} playlists", address.host, address.port,
+                payload.playlists.size());
         String body = request(address, PlaylistSyncProtocol.PATH_APPLY, "POST",
                 PlaylistSyncProtocol.toJson(payload), listener);
         PlaylistSyncProtocol.ApplyResult result;
@@ -122,6 +128,8 @@ public final class PlaylistSyncClient {
             throw new SyncException("invalid result response", error);
         }
         if (result == null) throw new SyncException("empty result response");
+        Logger.info("sync apply {}:{} -> ok={} error={}", address.host, address.port,
+                result.ok, result.error);
         return result;
     }
 

@@ -216,7 +216,10 @@ public final class PlaylistSyncServer {
             return;
         }
         PlaylistSyncProtocol.PlanResult result = new PlaylistSyncProtocol.PlanResult();
+        Logger.info("sync plan from {}: {} playlists / {} tracks / {} deletions",
+                remote, plan.playlistCount, plan.trackCount, plan.deletionCount);
         result.approved = confirm != null && confirm.confirm("import", remote, plan);
+        Logger.info("sync plan from {} {}", remote, result.approved ? "approved" : "rejected");
         if (!result.approved) result.reason = "rejected on this device";
         write(socket, result.approved ? 200 : 403, PlaylistSyncProtocol.toJson(result));
     }
@@ -248,7 +251,10 @@ public final class PlaylistSyncServer {
             plan.trackCount += playlist.tracks == null ? 0 : playlist.tracks.size();
         }
         plan.deletionCount = payload.deletedPlaylists.size();
+        Logger.info("sync apply from {}: {} playlists / {} tracks / {} deletions",
+                remote, plan.playlistCount, plan.trackCount, plan.deletionCount);
         if (confirm == null || !confirm.confirm("apply", remote, plan)) {
+            Logger.info("sync apply from {} rejected", remote);
             write(socket, 403, "{\"error\":\"rejected on this device\"}");
             return;
         }
@@ -256,9 +262,13 @@ public final class PlaylistSyncServer {
             PlaylistSyncSnapshot snapshot = new PlaylistSyncSnapshot(
                     payload.playlists, payload.deletedPlaylists);
             PlaylistMerge.Result merged = store.applySyncSnapshotAndSave(snapshot);
+            Logger.info("sync apply from {} done: +{} playlists, -{} playlists, +{} tracks, -{} tracks",
+                    remote, merged.addedPlaylists, merged.removedPlaylists,
+                    merged.addedTracks, merged.removedTracks);
             write(socket, 200, PlaylistSyncProtocol.toJson(
                     PlaylistSyncProtocol.resultOf(merged)));
         } catch (Exception error) {
+            Logger.warn("sync apply from {} failed: {}", remote, error.toString());
             PlaylistSyncProtocol.ApplyResult result = new PlaylistSyncProtocol.ApplyResult();
             result.error = error.getMessage() == null ? "apply failed" : error.getMessage();
             write(socket, 500, PlaylistSyncProtocol.toJson(result));
