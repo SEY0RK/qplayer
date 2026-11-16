@@ -184,7 +184,7 @@ jobs:
   release:
     # Publish only when explicitly requested. With source_run_id set, this
     # reuses an existing artifact and skips every build job.
-    if: inputs.publish || github.event_name == 'push'
+    if: always() && (inputs.publish || github.event_name == 'push')
     needs: [bundle]
     runs-on: ubuntu-latest
     permissions:
