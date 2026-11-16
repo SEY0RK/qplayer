@@ -5472,6 +5472,37 @@ public final class PlayerController {
         sendLocalPlaylistsTo(target.host + ":" + target.port);
     }
 
+    /** Diagnostic: only checks GET /status, without asking the peer to merge. */
+    public void testDeviceSyncConnection(String addressText) {
+        ioWorker.submit(() -> {
+            onHost(() -> {
+                deviceSyncPhase.set("preparing");
+                deviceSyncMessage.set("");
+                deviceSyncProgress.set(0);
+            });
+            try {
+                PlaylistSyncClient.Address address = PlaylistSyncClient.parseAddress(
+                        addressText, PlaylistSyncProtocol.DEFAULT_PORT);
+                PlaylistSyncProtocol.Status status = new PlaylistSyncClient(
+                        deviceSyncState.deviceId(), deviceSyncState.deviceName()).status(address);
+                final String detail = "连接成功：" + status.deviceName
+                        + (status.platform == null || status.platform.isEmpty()
+                           ? "" : " · " + status.platform);
+                onHost(() -> {
+                    deviceSyncPhase.set("done");
+                    deviceSyncMessage.set(detail);
+                });
+            } catch (SyncException error) {
+                final String message = "连接失败：" + (error.getMessage() == null
+                        ? "unknown" : error.getMessage());
+                onHost(() -> {
+                    deviceSyncPhase.set("error");
+                    deviceSyncMessage.set(message);
+                });
+            }
+        });
+    }
+
     private void refreshLocalPlaylistsAfterSync() {
         publishLocalPlaylists();
         saveLocalPlaylists();

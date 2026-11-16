@@ -149,6 +149,16 @@ Item {
             onClicked: player.requestLocalPlaylistImport()
         }
 
+        // Device sync is about the whole local-playlist collection, so it lives
+        // on the collection page rather than inside one playlist.
+        IconButton {
+            objectName: "libraryDeviceSyncButton"
+            visible: page.showLocal
+            type: "standard"
+            icon: "sync"
+            onClicked: deviceSyncDialog.open()
+        }
+
         IconButton {
             id: viewToggle
             objectName: "libraryViewToggle"
@@ -372,6 +382,8 @@ Item {
     }
 
     // ---- Dialogs -----------------------------------------------------------------
+
+    DeviceSyncDialog { id: deviceSyncDialog }
 
     Dialog {
         id: createDialog

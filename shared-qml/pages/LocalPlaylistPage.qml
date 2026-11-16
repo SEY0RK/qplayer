@@ -42,8 +42,6 @@ Rectangle {
     }
 
     property string filterText: ""
-    property string syncTargetText: ""
-    property bool syncDialogOpen: false
     property var filteredTracks: {
         var all = page.tracksList
         if (!all) return all
@@ -541,10 +539,6 @@ Rectangle {
                 })
             }
             items.push({
-                text: "设备同步…", icon: "sync",
-                action: function() { deviceSyncDialog.open() }
-            })
-            items.push({
                 text: i18n.t("playlist.local.pickCover"), icon: "image",
                 action: function() { player.pickLocalPlaylistCover(page.playlistId) }
             })
@@ -585,156 +579,6 @@ Rectangle {
             type: "outlined"
             label: i18n.t("library.create.hint")
             onAccepted: { renameDialog.accepted(); renameDialog.close() }
-        }
-    }
-
-    ListModel { id: syncDevicesModel }
-
-    function reloadSyncDevices() {
-        var peers
-        try { peers = JSON.parse(player.deviceSyncDevicesJson || "[]") }
-        catch (e) { peers = [] }
-        syncDevicesModel.clear()
-        for (var i = 0; i < peers.length; ++i) {
-            var p = peers[i]
-            syncDevicesModel.append({
-                deviceId: p.deviceId || "",
-                deviceName: p.deviceName || "未知设备",
-                host: p.host || "",
-                port: p.port || 0,
-                platform: p.platform || ""
-            })
-        }
-    }
-
-    // Device sync lives with the playlists it syncs, not in the settings page.
-    Dialog {
-        id: deviceSyncDialog
-        objectName: "deviceSyncDialog"
-        topInset: settings.topInset
-        bottomInset: settings.bottomInset
-        icon: "sync"
-        title: "设备同步"
-        showAcceptButton: false
-        rejectText: "关闭"
-        onOpenedChanged: page.syncDialogOpen = opened
-
-        Column {
-            width: deviceSyncDialog.contentWidth
-            spacing: Ui.space3
-
-            Row {
-                width: parent.width
-                spacing: Ui.space2
-                Button {
-                    id: receiveToggle
-                    objectName: "deviceSyncToggle"
-                    type: "filledTonal"
-                    text: player.deviceSyncRunning ? "停止接收" : "开启接收"
-                    onClicked: {
-                        if (player.deviceSyncRunning) player.stopDeviceSync()
-                        else player.startDeviceSync()
-                    }
-                }
-                Text {
-                    width: parent.width - parent.spacing - 96
-                    text: player.deviceSyncRunning
-                        ? ("接收中 · " + player.deviceSyncLocalAddress
-                           + ":" + player.deviceSyncPort)
-                        : "仅同步本地歌单；平台歌单靠各自账号同步"
-                    color: Ui.textSecondary
-                    font.pixelSize: Ui.textCallout
-                    elide: Text.ElideRight
-                    maximumLineCount: 1
-                }
-            }
-
-            Text {
-                text: "附近设备"
-                color: Ui.textSecondary
-                font.pixelSize: Ui.textCallout
-            }
-
-            Repeater {
-                model: syncDevicesModel
-                delegate: Button {
-                    objectName: "deviceSyncPeer"
-                    width: parent.width
-                    type: "standard"
-                    text: (model.deviceName || "设备") + " · "
-                          + model.host + ":" + model.port
-                    onClicked: player.sendLocalPlaylistsToDevice(model.deviceId)
-                }
-            }
-
-            Text {
-                visible: syncDevicesModel.count === 0
-                text: player.deviceSyncRunning
-                    ? "未发现设备；也可在下方手动输入地址"
-                    : "开启接收后才能发现附近设备"
-                color: Ui.textSecondary
-                font.pixelSize: Ui.textCallout
-            }
-
-            TextField {
-                objectName: "deviceSyncTarget"
-                type: "outlined"
-                label: "接收方地址 (例 192.168.1.5:39890)"
-                leadingIcon: "link"
-                width: parent.width
-                height: implicitHeight
-                text: page.syncTargetText
-                onTextChanged: page.syncTargetText = text
-            }
-
-            Button {
-                objectName: "deviceSyncSendButton"
-                type: "filled"
-                width: parent.width
-                text: "推送全部"
-                enabled: player.deviceSyncPhase === "idle"
-                         || player.deviceSyncPhase === "done"
-                onClicked: player.sendLocalPlaylistsTo(page.syncTargetText)
-            }
-
-            Rectangle {
-                width: parent.width
-                height: 4
-                radius: Ui.radiusFull
-                color: Ui.surfaceRaised
-                Rectangle {
-                    width: parent.width * player.deviceSyncProgress / 100
-                    height: parent.height
-                    radius: Ui.radiusFull
-                    color: Ui.accent
-                }
-            }
-
-            Text {
-                width: parent.width
-                text: {
-                    var phase = player.deviceSyncPhase
-                    if (phase === "idle") return ""
-                    if (phase === "asking") return "等待对方确认…"
-                    if (phase === "sending") return "正在同步… "
-                        + player.deviceSyncProgress + "%"
-                    return player.deviceSyncMessage
-                }
-                color: player.deviceSyncPhase === "error" ? Ui.danger : Ui.textSecondary
-                font.pixelSize: Ui.textCallout
-                elide: Text.ElideRight
-                maximumLineCount: 1
-            }
-        }
-
-        Timer {
-            interval: 700
-            repeat: true
-            running: page.syncDialogOpen && player.deviceSyncRunning
-            onTriggered: {
-                player.refreshDeviceSyncDevices()
-                reloadSyncDevices()
-            }
         }
     }
 

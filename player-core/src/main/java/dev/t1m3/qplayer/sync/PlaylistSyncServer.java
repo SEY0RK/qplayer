@@ -77,7 +77,10 @@ public final class PlaylistSyncServer {
             try {
                 ServerSocket socket = new ServerSocket();
                 socket.setReuseAddress(true);
-                socket.bind(new InetSocketAddress(candidate));
+                // IPv4 explicitly: an IPv6-only wildcard bind would make the
+                // desktop's IPv4 connection fail on some Android builds.
+                socket.bind(new InetSocketAddress(
+                        java.net.InetAddress.getByName("0.0.0.0"), candidate));
                 serverSocket = socket;
                 port = candidate;
                 break;

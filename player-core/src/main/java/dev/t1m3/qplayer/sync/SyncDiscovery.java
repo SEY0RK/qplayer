@@ -7,12 +7,17 @@ import dev.t1m3.qplayer.util.Logger;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Tiny LAN discovery for local-playlist sync.
@@ -67,11 +72,26 @@ public final class SyncDiscovery {
     }
 
     /**
-     * The LAN address another device should dial. No packet is sent: connecting
-     * a UDP socket to a public endpoint just lets the OS pick the right source
-     * interface. Returns "" when the device has no routable network.
+     * The LAN address another device should dial. Prefers a real site-local
+     * IPv4 address on a non-virtual interface; falls back to the default route.
+     * Returns "" when the device has no routable network.
      */
     public static String localLanAddress() {
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                NetworkInterface nic = interfaces.nextElement();
+                if (!nic.isUp() || nic.isLoopback() || isVirtual(nic.getName())) continue;
+                for (InterfaceAddress address : nic.getInterfaceAddresses()) {
+                    InetAddress ip = address.getAddress();
+                    if (ip != null && ip.getAddress().length == 4
+                            && ip.isSiteLocalAddress() && !ip.isLoopbackAddress()) {
+                        return ip.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.connect(InetAddress.getByName("8.8.8.8"), 53);
             InetAddress local = socket.getLocalAddress();
@@ -82,6 +102,14 @@ public final class SyncDiscovery {
             // Offline / no default route: manual entry is still possible.
         }
         return "";
+    }
+
+    private static boolean isVirtual(String name) {
+        String n = name == null ? "" : name.toLowerCase();
+        return n.contains("docker") || n.contains("veth") || n.contains("vmnet")
+                || n.contains("vethernet") || n.contains("virtual")
+                || n.contains("tun") || n.contains("tap") || n.contains("utun")
+                || n.contains("wsl") || n.contains("loopback");
     }
 
     /**
@@ -102,7 +130,11 @@ public final class SyncDiscovery {
         try {
             listen = new DatagramSocket(null);
             listen.setReuseAddress(true);
-            listen.bind(new java.net.InetSocketAddress(DISCOVERY_PORT));
+            // Force IPv4: some Android builds bind a wildcard DatagramSocket to
+            // IPv6-only, which silently drops the IPv4 broadcasts the desktop
+            // sends. The whole sync protocol is IPv4 on the LAN.
+            listen.bind(new java.net.InetSocketAddress(InetAddress.getByName("0.0.0.0"),
+                    DISCOVERY_PORT));
             listen.setSoTimeout(1_000);
         } catch (Exception error) {
             running = false;
@@ -150,20 +182,19 @@ public final class SyncDiscovery {
     private void sendLoop() {
         DatagramSocket socket = null;
         try {
-            socket = new DatagramSocket();
+            socket = new DatagramSocket(0, InetAddress.getByName("0.0.0.0"));
             socket.setBroadcast(true);
             sendSocket = socket;
-            InetAddress broadcast = InetAddress.getByName("255.255.255.255");
             while (running) {
-                JsonObject json = new JsonObject();
-                json.addProperty("format", FORMAT);
-                json.addProperty("version", VERSION);
-                json.addProperty("deviceId", selfId);
-                json.addProperty("deviceName", selfName);
-                json.addProperty("platform", selfPlatform);
-                json.addProperty("port", selfPort);
-                byte[] payload = json.toString().getBytes(StandardCharsets.UTF_8);
-                socket.send(new DatagramPacket(payload, payload.length, broadcast, DISCOVERY_PORT));
+                byte[] payload = announcement(false);
+                for (InetAddress target : broadcastTargets()) {
+                    try {
+                        socket.send(new DatagramPacket(payload, payload.length,
+                                target, DISCOVERY_PORT));
+                    } catch (Exception ignored) {
+                        // One dead interface must not stop the others.
+                    }
+                }
                 sleep(INTERVAL_MS);
             }
         } catch (Exception error) {
@@ -200,6 +231,20 @@ public final class SyncDiscovery {
                             platform == null ? "" : platform, host, port,
                             System.currentTimeMillis()));
                 }
+                // Broadcast is often one-way on Wi-Fi: the phone can reach the
+                // PC but the PC's broadcast is filtered before it reaches the
+                // phone. Answer every fresh announcement with a unicast packet
+                // so the sender also appears in the other device's list. A
+                // reply marked as such is never answered again.
+                if (!jsonBool(json, "reply", false)) {
+                    byte[] reply = announcement(true);
+                    try {
+                        socket.send(new DatagramPacket(reply, reply.length,
+                                packet.getAddress(), DISCOVERY_PORT));
+                    } catch (Exception ignored) {
+                        // The peer will retry on its next broadcast.
+                    }
+                }
             } catch (java.net.SocketTimeoutException timeout) {
                 // Expected: lets the loop re-check `running` and prune peers.
                 prune();
@@ -207,6 +252,40 @@ public final class SyncDiscovery {
                 if (running) Logger.warn("sync discovery packet ignored: {}", error.getMessage());
             }
         }
+    }
+
+    private byte[] announcement(boolean reply) {
+        JsonObject json = new JsonObject();
+        json.addProperty("format", FORMAT);
+        json.addProperty("version", VERSION);
+        json.addProperty("deviceId", selfId);
+        json.addProperty("deviceName", selfName);
+        json.addProperty("platform", selfPlatform);
+        json.addProperty("port", selfPort);
+        json.addProperty("reply", reply);
+        return json.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** Limited broadcast plus one directed broadcast per real interface. */
+    private static Set<InetAddress> broadcastTargets() {
+        Set<InetAddress> targets = new LinkedHashSet<>();
+        try {
+            targets.add(InetAddress.getByName("255.255.255.255"));
+        } catch (Exception ignored) {
+        }
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                NetworkInterface nic = interfaces.nextElement();
+                if (!nic.isUp() || nic.isLoopback()) continue;
+                for (InterfaceAddress address : nic.getInterfaceAddresses()) {
+                    InetAddress broadcast = address.getBroadcast();
+                    if (broadcast != null) targets.add(broadcast);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return targets;
     }
 
     private void prune() {
@@ -225,6 +304,15 @@ public final class SyncDiscovery {
         try {
             return json.has(key) && json.get(key).isJsonPrimitive()
                     ? json.get(key).getAsInt() : fallback;
+        } catch (RuntimeException error) {
+            return fallback;
+        }
+    }
+
+    private static boolean jsonBool(JsonObject json, String key, boolean fallback) {
+        try {
+            return json.has(key) && json.get(key).isJsonPrimitive()
+                    ? json.get(key).getAsBoolean() : fallback;
         } catch (RuntimeException error) {
             return fallback;
         }
