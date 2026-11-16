@@ -94,7 +94,9 @@ public final class PlaylistMerge {
                 result.addedTracks += local.tracks.size();
                 continue;
             }
-            mergeOne(local, remote, mineDeleted, theirsDeleted, nowMs, result);
+            mergeOne(local, remote,
+                    trackTombstones(local.tombstones), trackTombstones(remote.tombstones),
+                    nowMs, result);
             result.updatedPlaylists++;
         }
 
@@ -120,7 +122,8 @@ public final class PlaylistMerge {
 
     /** Merge two versions of the same playlist into {@code local}. */
     private static void mergeOne(LocalPlaylist local, LocalPlaylist remote,
-                                 Map<String, Long> mineDeleted, Map<String, Long> theirsDeleted,
+                                 Map<String, Long> localTrackDeleted,
+                                 Map<String, Long> remoteTrackDeleted,
                                  long nowMs, Result result) {
         boolean remoteIsNewer = remote.updatedAtMs >= local.updatedAtMs;
         LocalPlaylist skeleton = remoteIsNewer ? remote : local;
@@ -132,7 +135,7 @@ public final class PlaylistMerge {
         Map<String, PlaylistTrack> mergedTracks = new LinkedHashMap<String, PlaylistTrack>();
         for (PlaylistTrack track : skeleton.tracks) {
             if (track == null || !track.valid()) continue;
-            if (isDeleted(track, theirsDeleted) || isDeleted(track, mineDeleted)) {
+            if (isDeleted(track, remoteTrackDeleted) || isDeleted(track, localTrackDeleted)) {
                 result.removedTracks++;
                 continue;
             }
@@ -143,7 +146,7 @@ public final class PlaylistMerge {
         for (PlaylistTrack track : other.tracks) {
             if (track == null || !track.valid()) continue;
             if (mergedTracks.containsKey(track.mediaId)) continue;
-            if (isDeleted(track, theirsDeleted) || isDeleted(track, mineDeleted)) continue;
+            if (isDeleted(track, remoteTrackDeleted) || isDeleted(track, localTrackDeleted)) continue;
             mergedTracks.put(track.mediaId, copyTrack(track));
             result.addedTracks++;
         }
@@ -210,6 +213,19 @@ public final class PlaylistMerge {
         Long removedAt = deletions.get(track.mediaId);
         if (removedAt == null) return false;
         return removedAt + CLOCK_TOLERANCE_MS >= track.addedAtMs;
+    }
+
+    private static Map<String, Long> trackTombstones(List<TrackTombstone> tombstones) {
+        Map<String, Long> out = new HashMap<String, Long>();
+        if (tombstones == null) return out;
+        for (TrackTombstone tombstone : tombstones) {
+            if (tombstone == null || tombstone.mediaId == null || tombstone.mediaId.isEmpty()) continue;
+            Long previous = out.get(tombstone.mediaId);
+            if (previous == null || tombstone.removedAtMs > previous) {
+                out.put(tombstone.mediaId, tombstone.removedAtMs);
+            }
+        }
+        return out;
     }
 
     private static Map<String, Long> tombstoneTimes(List<PlaylistTombstone> tombstones,
