@@ -28,6 +28,6 @@
     ]
   },
   "engine_repo": "SEY0RK/qml4j-ime",
-  "engine_ref": "v0.2.39-ime",
+  "engine_ref": "main",
   "engine_version": "v0.2.39"
 }
