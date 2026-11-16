@@ -38,6 +38,11 @@ import dev.t1m3.qplayer.netease.dto.NeteasePlaylist;
 import dev.t1m3.qplayer.netease.dto.NeteaseSong;
 import dev.t1m3.qplayer.playlist.LocalPlaylist;
 import dev.t1m3.qplayer.playlist.LocalPlaylistStore;
+import dev.t1m3.qplayer.playlist.PlaylistStoreAccess;
+import dev.t1m3.qplayer.sync.DeviceSyncState;
+import dev.t1m3.qplayer.sync.PlaylistSyncClient;
+import dev.t1m3.qplayer.sync.PlaylistSyncProtocol;
+import dev.t1m3.qplayer.sync.SyncException;
 import dev.t1m3.qplayer.playlist.MyPlaylistOrderStore;
 import dev.t1m3.qplayer.playlist.PlaylistSubscription;
 import dev.t1m3.qplayer.playlist.PlaylistTrack;
@@ -834,6 +839,19 @@ public final class PlayerController {
      *  since dragging a row inside a sorted view would have nowhere to land. */
     public final Property<Boolean> localPlaylistReorderable = new Property<>(true);
 
+    // --- Device sync (local playlists, one-way sender -> receiver) ---------
+    /** Receiver service state, bound by the settings page. */
+    public final Property<Boolean> deviceSyncRunning = new Property<>(false);
+    public final Property<Integer> deviceSyncPort = new Property<>(0);
+    public final Property<String> deviceSyncId = new Property<>("");
+    /** Sender progress: idle / preparing / asking / sending / done / error. */
+    public final Property<String> deviceSyncPhase = new Property<>("idle");
+    public final Property<String> deviceSyncMessage = new Property<>("");
+    /** A pending receiver-side request, shown by the confirm dialog. */
+    public final Property<String> deviceSyncRequestFrom = new Property<>("");
+    public final Property<Integer> deviceSyncRequestCount = new Property<>(0);
+    public final Property<Integer> deviceSyncRequestTracks = new Property<>(0);
+
     // --- Account ----------------------------------------------------------
     public final Property<Boolean> loggedIn = new Property<>(false);
     public final Property<String> userName = new Property<>("");
@@ -1032,6 +1050,8 @@ public final class PlayerController {
             playbackHistoryStore.setOnChanged(() -> onMain(this::playbackHistoryResourcesChanged));
             loadPlaybackHistory();
 
+            deviceSyncState.setDeviceName("QPlayer 本地版");
+            deviceSyncState.setPlatform(System.getProperty("os.name", ""));
             // LocalPlaylistStore owns the old custom-playlist file migration.
             localPlaylistStore.load();
             publishLocalPlaylists();
@@ -4302,6 +4322,8 @@ public final class PlayerController {
     // surface, the threading, and the network fetch.
 
     private final LocalPlaylistStore localPlaylistStore = new LocalPlaylistStore();
+    private final DeviceSyncState deviceSyncState = new DeviceSyncState(
+            AppDirs.configFile("device-sync-id.txt"));
     private final MyPlaylistOrderStore myPlaylistOrderStore = new MyPlaylistOrderStore();
     /** "source" (server grouping, primary first) or "custom" (user-dragged). QML
      *  drives the sort menu off this and only allows the drag gesture in custom. */
@@ -5298,6 +5320,116 @@ public final class PlayerController {
 
     /** Whether QML should offer the import/export rows at all. */
     public final Property<Boolean> playlistTransferAvailable = new Property<>(false);
+
+    // --- Device sync -------------------------------------------------------
+
+    /** Starts the receiving service. Safe to call repeatedly; no-op when on. */
+    public void startDeviceSync() {
+        ioWorker.submit(() -> {
+            boolean started = deviceSyncState.startServer((PlaylistStoreAccess) localPlaylistStore);
+            final int port = deviceSyncState.port();
+            onHost(() -> {
+                deviceSyncRunning.set(started);
+                deviceSyncPort.set(port);
+                deviceSyncId.set(deviceSyncState.deviceId());
+            });
+            if (!started) deviceSyncMessage.set(I18n.tr("toast.deviceSync.portUnavailable"));
+        });
+    }
+
+    public void stopDeviceSync() {
+        ioWorker.submit(() -> {
+            deviceSyncState.stopServer();
+            onHost(() -> {
+                deviceSyncRunning.set(false);
+                deviceSyncPort.set(0);
+                deviceSyncRequestFrom.set("");
+                deviceSyncRequestCount.set(0);
+                deviceSyncRequestTracks.set(0);
+                deviceSyncPhase.set("idle");
+            });
+        });
+    }
+
+    /** Sender side: push every local playlist to the given host:port. */
+    public void sendLocalPlaylistsTo(String addressText) {
+        ioWorker.submit(() -> {
+            onHost(() -> {
+                deviceSyncPhase.set("preparing");
+                deviceSyncMessage.set("");
+            });
+            try {
+                PlaylistSyncClient.Address address = PlaylistSyncClient.parseAddress(
+                        addressText, PlaylistSyncProtocol.DEFAULT_PORT);
+                PlaylistSyncClient client = new PlaylistSyncClient(
+                        deviceSyncState.deviceId(), deviceSyncState.deviceName());
+                PlaylistSyncProtocol.Status status = client.status(address);
+                final String name = status.deviceName;
+                onHost(() -> deviceSyncMessage.set(name));
+
+                onHost(() -> deviceSyncPhase.set("asking"));
+                dev.t1m3.qplayer.playlist.PlaylistSyncSnapshot snapshot =
+                        localPlaylistStore.snapshot();
+                if (!client.requestApproval(address, snapshot)) {
+                    onHost(() -> {
+                        deviceSyncPhase.set("rejected");
+                        deviceSyncMessage.set(I18n.tr("toast.deviceSync.rejected"));
+                    });
+                    return;
+                }
+                onHost(() -> deviceSyncPhase.set("sending"));
+                PlaylistSyncProtocol.ApplyResult result = client.send(address, snapshot);
+                final boolean ok = result.ok;
+                final String detail = I18n.tr("toast.deviceSync.sent",
+                        result.addedPlaylists, result.removedPlaylists,
+                        result.addedTracks, result.removedTracks);
+                refreshLocalPlaylistsAfterSync();
+                onHost(() -> {
+                    deviceSyncPhase.set(ok ? "done" : "error");
+                    deviceSyncMessage.set(detail);
+                });
+            } catch (SyncException error) {
+                final String message = error.getMessage() == null
+                        ? "sync failed" : error.getMessage();
+                onHost(() -> {
+                    deviceSyncPhase.set("error");
+                    deviceSyncMessage.set(message);
+                });
+                showToast(I18n.tr("toast.deviceSync.failed", message));
+            }
+        });
+    }
+
+    /** Receiver side, called from QML after the confirm dialog shows the summary. */
+    public void approveDeviceSync() {
+        deviceSyncState.approve();
+    }
+
+    public void rejectDeviceSync() {
+        deviceSyncState.reject();
+    }
+
+    /** Polled by the settings page while the receiver service runs. */
+    public void refreshDeviceSyncRequest() {
+        PlaylistSyncProtocol.Plan request = deviceSyncState.pending();
+        if (request == null) {
+            deviceSyncRequestFrom.set("");
+            deviceSyncRequestCount.set(0);
+            deviceSyncRequestTracks.set(0);
+            return;
+        }
+        deviceSyncRequestFrom.set(request.deviceName == null ? "" : request.deviceName);
+        deviceSyncRequestCount.set(request.playlistCount);
+        deviceSyncRequestTracks.set(request.trackCount);
+    }
+
+    private void refreshLocalPlaylistsAfterSync() {
+        publishLocalPlaylists();
+        saveLocalPlaylists();
+        String open = openLocalPlaylistId.peek();
+        if (open != null && !open.isEmpty()) publishOpenLocalPlaylist();
+    }
+
 
     public void requestLocalPlaylistExport(String playlistId) {
         synchronized (QmlRuntimeLock.MONITOR) {
