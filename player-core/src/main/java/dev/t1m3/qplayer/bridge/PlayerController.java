@@ -854,6 +854,10 @@ public final class PlayerController {
     public final Property<Integer> deviceSyncRequestTracks = new Property<>(0);
     /** LAN peers as a JSON array, refreshed by the settings page poller. */
     public final Property<String> deviceSyncDevicesJson = new Property<>("[]");
+    /** This device's LAN address, shown so the other side can dial it manually. */
+    public final Property<String> deviceSyncLocalAddress = new Property<>("");
+    /** Sender transfer progress, 0-100. */
+    public final Property<Integer> deviceSyncProgress = new Property<>(0);
 
     // --- Account ----------------------------------------------------------
     public final Property<Boolean> loggedIn = new Property<>(false);
@@ -5335,6 +5339,7 @@ public final class PlayerController {
                 deviceSyncRunning.set(started);
                 deviceSyncPort.set(port);
                 deviceSyncId.set(deviceSyncState.deviceId());
+                deviceSyncLocalAddress.set(SyncDiscovery.localLanAddress());
             });
             if (!started) deviceSyncMessage.set(I18n.tr("toast.deviceSync.portUnavailable"));
         });
@@ -5350,6 +5355,7 @@ public final class PlayerController {
                 deviceSyncRequestCount.set(0);
                 deviceSyncRequestTracks.set(0);
                 deviceSyncPhase.set("idle");
+                deviceSyncProgress.set(0);
                 deviceSyncDevicesJson.set("[]");
             });
         });
@@ -5381,8 +5387,12 @@ public final class PlayerController {
                     });
                     return;
                 }
-                onHost(() -> deviceSyncPhase.set("sending"));
-                PlaylistSyncProtocol.ApplyResult result = client.send(address, snapshot);
+                onHost(() -> {
+                    deviceSyncPhase.set("sending");
+                    deviceSyncProgress.set(0);
+                });
+                PlaylistSyncProtocol.ApplyResult result = client.send(address, snapshot,
+                        percent -> onHost(() -> deviceSyncProgress.set(percent)));
                 final boolean ok = result.ok;
                 final String detail = I18n.tr("toast.deviceSync.sent",
                         result.addedPlaylists, result.removedPlaylists,
@@ -5390,6 +5400,7 @@ public final class PlayerController {
                 refreshLocalPlaylistsAfterSync();
                 onHost(() -> {
                     deviceSyncPhase.set(ok ? "done" : "error");
+                    deviceSyncProgress.set(ok ? 100 : 0);
                     deviceSyncMessage.set(detail);
                 });
             } catch (SyncException error) {
@@ -5407,10 +5418,18 @@ public final class PlayerController {
     /** Receiver side, called from QML after the confirm dialog shows the summary. */
     public void approveDeviceSync() {
         deviceSyncState.approve();
+        clearDeviceSyncRequest();
     }
 
     public void rejectDeviceSync() {
         deviceSyncState.reject();
+        clearDeviceSyncRequest();
+    }
+
+    private void clearDeviceSyncRequest() {
+        deviceSyncRequestFrom.set("");
+        deviceSyncRequestCount.set(0);
+        deviceSyncRequestTracks.set(0);
     }
 
     /** Polled by the settings page while the receiver service runs. */

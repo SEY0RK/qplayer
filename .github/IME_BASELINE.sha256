@@ -7,5 +7,5 @@
 0d567c878dede3a89390c7ec6776f686837211dc353d1a73241fd954859e95e1  desktop-host/src/main/java/dev/t1m3/qplayer/desktop/window/WinIme.java
 a9165fc903b205fa6d37ec430bb7838aa3d8c0e62dd65eb9adf293c40481a5d8  desktop-host/pom.xml
 b8fedd21e15b36e0a6dbece74e238f3be53b4fec254097d5a4eec559da24da07  shared-qml/miuix/Core/TextField.qml
-e0191ecfc4c53a7c426c4b8393ff59469a0d7d71eca1f183ece8ae113783c75d  shared-qml/Main.qml
-c51733c2f61e7ad33a456c21ce3ed40c9ab1ca2e1c33bb5a33ae96272e337cf0  player-core/src/main/java/dev/t1m3/qplayer/bridge/PlayerController.java
+ce229881656b42c52c641dfe4211f6a2868e876abb5f72219f41b2fff7698fec  shared-qml/Main.qml
+679b96637dfa3c37c1224ec41ff73d13f243b05523b22ef3900e4abf64383d0e  player-core/src/main/java/dev/t1m3/qplayer/bridge/PlayerController.java

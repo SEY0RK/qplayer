@@ -98,12 +98,23 @@ public final class PlaylistSyncClient {
         }
     }
 
+    /** Called on the sending thread with 0-99 while the payload is written. */
+    public interface ProgressListener {
+        void onProgress(int percent);
+    }
+
     public PlaylistSyncProtocol.ApplyResult send(Address address, PlaylistSyncSnapshot snapshot)
+            throws SyncException {
+        return send(address, snapshot, null);
+    }
+
+    public PlaylistSyncProtocol.ApplyResult send(Address address, PlaylistSyncSnapshot snapshot,
+                                                 ProgressListener listener)
             throws SyncException {
         PlaylistSyncProtocol.Payload payload =
                 PlaylistSyncProtocol.payloadFor(deviceId, deviceName, snapshot);
         String body = request(address, PlaylistSyncProtocol.PATH_APPLY, "POST",
-                PlaylistSyncProtocol.toJson(payload));
+                PlaylistSyncProtocol.toJson(payload), listener);
         PlaylistSyncProtocol.ApplyResult result;
         try {
             result = PlaylistSyncProtocol.fromJson(body, PlaylistSyncProtocol.ApplyResult.class);
@@ -115,6 +126,12 @@ public final class PlaylistSyncClient {
     }
 
     private String request(Address address, String path, String method, String body)
+            throws SyncException {
+        return request(address, path, method, body, null);
+    }
+
+    private String request(Address address, String path, String method, String body,
+                           ProgressListener listener)
             throws SyncException {
         HttpURLConnection connection = null;
         try {
@@ -129,7 +146,16 @@ public final class PlaylistSyncClient {
                 byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
                 connection.setFixedLengthStreamingMode(bytes.length);
                 OutputStream out = connection.getOutputStream();
-                out.write(bytes);
+                int chunk = 64 * 1024;
+                for (int offset = 0; offset < bytes.length; offset += chunk) {
+                    out.write(bytes, offset, Math.min(chunk, bytes.length - offset));
+                    if (listener != null) {
+                        int percent = (int) Math.min(99L,
+                                (offset + Math.min(chunk, bytes.length - offset)) * 100L
+                                        / bytes.length);
+                        listener.onProgress(percent);
+                    }
+                }
                 out.flush();
             }
             int status = connection.getResponseCode();

@@ -7,10 +7,9 @@ import dev.t1m3.qplayer.playlist.PlaylistStoreAccess;
 import dev.t1m3.qplayer.playlist.PlaylistTombstone;
 import dev.t1m3.qplayer.util.Logger;
 
-import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -136,10 +135,15 @@ public final class PlaylistSyncServer {
 
     void handle(Socket client) {
         try (Socket socket = client) {
-            BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            String requestLine = reader.readLine();
-            if (requestLine == null || requestLine.isEmpty()) return;
+            InputStream input = socket.getInputStream();
+            // Headers are read byte-wise, not through a Reader: the body length
+            // is in bytes and must never be consumed as chars (multi-byte UTF-8
+            // payloads would otherwise under- or over-read and stall).
+            String headerText = readHeader(input);
+            if (headerText.isEmpty()) return;
+            String[] lines = headerText.split("\r\n");
+            String requestLine = lines[0];
+            if (requestLine.isEmpty()) return;
             String[] parts = requestLine.split(" ");
             if (parts.length < 2) {
                 write(socket, 400, "{\"error\":\"bad request\"}");
@@ -148,11 +152,10 @@ public final class PlaylistSyncServer {
             String method = parts[0];
             String path = parts[1];
             int length = 0;
-            String line;
-            while ((line = reader.readLine()) != null && !line.isEmpty()) {
-                if (line.toLowerCase().startsWith("content-length:")) {
+            for (int i = 1; i < lines.length; i++) {
+                if (lines[i].toLowerCase().startsWith("content-length:")) {
                     try {
-                        length = Integer.parseInt(line.substring(15).trim());
+                        length = Integer.parseInt(lines[i].substring(15).trim());
                     } catch (NumberFormatException ignored) {
                         length = -1;
                     }
@@ -162,7 +165,7 @@ public final class PlaylistSyncServer {
                 write(socket, 413, "{\"error\":\"payload too large\"}");
                 return;
             }
-            String body = readBody(reader, length);
+            String body = readBody(input, length);
             String remote = socket.getInetAddress().getHostAddress();
 
             if (PlaylistSyncProtocol.PATH_STATUS.equals(path)) {
@@ -259,16 +262,37 @@ public final class PlaylistSyncServer {
         }
     }
 
-    private static String readBody(BufferedReader reader, int length) throws IOException {
+    /** Reads the ASCII request head, terminating after the blank line. */
+    private static String readHeader(InputStream input) throws IOException {
+        ByteArrayOutputStream head = new ByteArrayOutputStream();
+        int b;
+        while ((b = input.read()) >= 0) {
+            head.write(b);
+            byte[] bytes = head.toByteArray();
+            int n = bytes.length;
+            if (n >= 4 && bytes[n - 4] == '\r' && bytes[n - 3] == '\n'
+                    && bytes[n - 2] == '\r' && bytes[n - 1] == '\n') {
+                break;
+            }
+            if (n > 32 * 1024) {
+                throw new IOException("request head too large");
+            }
+        }
+        return new String(head.toByteArray(), StandardCharsets.US_ASCII);
+    }
+
+    private static String readBody(InputStream input, int length) throws IOException {
         if (length == 0) return "";
-        char[] buffer = new char[length];
+        ByteArrayOutputStream out = new ByteArrayOutputStream(length);
+        byte[] buffer = new byte[64 * 1024];
         int read = 0;
         while (read < length) {
-            int count = reader.read(buffer, read, length - read);
+            int count = input.read(buffer, 0, Math.min(buffer.length, length - read));
             if (count < 0) break;
+            out.write(buffer, 0, count);
             read += count;
         }
-        return new String(buffer, 0, read);
+        return new String(out.toByteArray(), StandardCharsets.UTF_8);
     }
 
     private static void write(Socket socket, int status, String body) throws IOException {

@@ -67,6 +67,24 @@ public final class SyncDiscovery {
     }
 
     /**
+     * The LAN address another device should dial. No packet is sent: connecting
+     * a UDP socket to a public endpoint just lets the OS pick the right source
+     * interface. Returns "" when the device has no routable network.
+     */
+    public static String localLanAddress() {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.connect(InetAddress.getByName("8.8.8.8"), 53);
+            InetAddress local = socket.getLocalAddress();
+            if (local != null && !local.isAnyLocalAddress() && !local.isLoopbackAddress()) {
+                return local.getHostAddress();
+            }
+        } catch (Exception ignored) {
+            // Offline / no default route: manual entry is still possible.
+        }
+        return "";
+    }
+
+    /**
      * Starts announcing and listening. Returns false only when the receive
      * socket cannot be bound; broadcast failures are retried in the thread.
      */

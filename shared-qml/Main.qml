@@ -862,6 +862,8 @@ Rectangle {
     PluginUpdateDialog { id: pluginUpdateDialog }
     AppUpdateDialog { id: appUpdateDialog }
 
+    DeviceSyncPromptDialog { }
+
     CredentialDialogs {
         id: credentialDialogs
         onRequestLogin: app.loginOpen = true

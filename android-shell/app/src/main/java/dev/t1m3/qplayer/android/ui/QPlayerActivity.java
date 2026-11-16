@@ -20,6 +20,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 
@@ -114,6 +115,8 @@ public final class QPlayerActivity extends Activity {
     private Consumer<Boolean> systemBarsListener;
     private BroadcastReceiver debugReceiver;
     private java.util.concurrent.CompletableFuture<PlayerController> initializing;
+    /** Keeps UDP broadcast/multicast reception alive for LAN device sync. */
+    private WifiManager.MulticastLock multicastLock;
 
     /** Caches the process controller across Activity recreations, and waits for
      * full old-engine termination before creating a replacement. */
@@ -144,6 +147,15 @@ public final class QPlayerActivity extends Activity {
         enableEdgeToEdge();
         attachInsetListener(root);
         splashView.post(this::startEngine);
+        // Android filters LAN broadcasts by default; without the lock the phone
+        // would see no nearby devices even though the PC can see the phone.
+        WifiManager wifi = (WifiManager) getApplicationContext()
+                .getSystemService(Context.WIFI_SERVICE);
+        if (wifi != null) {
+            multicastLock = wifi.createMulticastLock("qplayer-sync-discovery");
+            multicastLock.setReferenceCounted(false);
+            try { multicastLock.acquire(); } catch (RuntimeException ignored) {}
+        }
     }
 
     private void startEngine() {
@@ -1379,6 +1391,10 @@ public final class QPlayerActivity extends Activity {
     protected void onDestroy() {
         logSceneLifecycle("destroy");
         destroyed = true;
+        if (multicastLock != null) {
+            try { multicastLock.release(); } catch (RuntimeException ignored) {}
+            multicastLock = null;
+        }
         boolean ownsUi = boundUiToken == uiToken;
         if (ownsUi) boundUiToken = null;
         if (activeUiToken == uiToken && !isChangingConfigurations()) activeUiToken = null;
