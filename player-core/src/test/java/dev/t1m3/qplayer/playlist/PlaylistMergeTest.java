@@ -342,7 +342,7 @@ public class PlaylistMergeTest {
 
 
 
-        PlaylistMerge.Result result = merge(list(mine),
+        PlaylistMerge.Result result = merge(mine,
 
                 Collections.singletonList(localDeletion),
 
@@ -370,7 +370,7 @@ public class PlaylistMergeTest {
 
 
 
-        PlaylistMerge.Result result = merge(list(mine),
+        PlaylistMerge.Result result = merge(mine,
 
                 Collections.singletonList(localDeletion),
 
