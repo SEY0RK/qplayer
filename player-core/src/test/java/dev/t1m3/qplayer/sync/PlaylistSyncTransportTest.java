@@ -12,6 +12,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.junit.Test;
+
 import static org.junit.Assert.*;
 
 /** Real socket round-trip on loopback: server + client + merge, no mocks. */
@@ -154,7 +156,7 @@ public class PlaylistSyncTransportTest {
             MemoryStore sender = new MemoryStore();
             LocalPlaylist kept = playlist("local:playlist:a", "A", "netease:song:1");
             long now = System.currentTimeMillis();
-            kept.tombstones.add(new PlaylistTombstone("netease:song:2", now - 5_000L));
+            kept.tombstones.add(new dev.t1m3.qplayer.playlist.TrackTombstone("netease:song:2", now - 5_000L));
             sender.playlists.add(kept);
             PlaylistSyncClient client = new PlaylistSyncClient("dev-send", "Sender");
             PlaylistSyncClient.Address address =
