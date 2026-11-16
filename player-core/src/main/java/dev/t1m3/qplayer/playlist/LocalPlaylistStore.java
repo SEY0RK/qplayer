@@ -23,7 +23,7 @@ import java.util.List;
  * {@link #all()} and {@link #get(String)} are deep copies, so a caller can render
  * or export them without holding the lock or racing a concurrent sync.
  */
-public final class LocalPlaylistStore {
+public final class LocalPlaylistStore implements PlaylistStoreAccess {
 
     /** 2 adds playlist-level deletion records for device sync. Schema 1 files
      *  are still read and get an empty deletion list. */
@@ -220,6 +220,13 @@ public final class LocalPlaylistStore {
             deletedPlaylists.addAll(result.deletedPlaylists);
             dirty = true;
         }
+        return result;
+    }
+
+    @Override
+    public synchronized PlaylistMerge.Result applySyncSnapshotAndSave(PlaylistSyncSnapshot incoming) {
+        PlaylistMerge.Result result = applySnapshot(incoming);
+        if (result.changed) save();
         return result;
     }
 
