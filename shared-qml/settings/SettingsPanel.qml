@@ -217,6 +217,144 @@ ColumnLayout {
         }
     }
 
+    // ---- Device sync (local playlists) ----------------------------------------
+    SettingCard {
+        objectName: "settingsDeviceSyncCard"
+        Layout.fillWidth: true
+        Layout.preferredHeight: implicitHeight
+        visible: panel.category === "about"
+
+        Item {
+            id: syncHead
+            Layout.fillWidth: true
+            implicitHeight: syncHeadFrame.implicitHeight
+            SettingRowFrame {
+                id: syncHeadFrame
+                width: syncHead.width
+                height: syncHead.height
+                icon: "sync"
+                iconColor: Ui.accent
+                title: "本地歌单设备同步"
+                summary: player.deviceSyncRunning
+                    ? ("接收中 · " + player.deviceSyncPort + " · ID " + player.deviceSyncId)
+                    : "仅同步本地歌单；平台歌单靠各自账号同步"
+                clickable: false
+                controlWidth: syncToggle.width
+            }
+            Button {
+                id: syncToggle
+                objectName: "settingsDeviceSyncToggle"
+                x: syncHead.width - Ui.space4 - width
+                y: (syncHead.height - height) / 2
+                type: "filledTonal"
+                text: player.deviceSyncRunning ? "停止" : "开启接收"
+                onClicked: {
+                    if (player.deviceSyncRunning) player.stopDeviceSync()
+                    else player.startDeviceSync()
+                }
+            }
+        }
+
+        Item {
+            objectName: "settingsDeviceSyncSend"
+            Layout.fillWidth: true
+            implicitHeight: 52
+            TextField {
+                id: syncTarget
+                objectName: "settingsDeviceSyncTarget"
+                x: Ui.space4
+                y: 6
+                width: parent.width - Ui.space4 - syncSendButton.width - Ui.space4
+                label: "接收方地址 (例 192.168.1.5:39890)"
+                leadingIcon: "link"
+            }
+            Button {
+                id: syncSendButton
+                objectName: "settingsDeviceSyncSendButton"
+                x: parent.width - Ui.space4 - width
+                y: 6
+                type: "filled"
+                text: "推送全部"
+                enabled: player.deviceSyncPhase === "idle" || player.deviceSyncPhase === "done"
+                onClicked: player.sendLocalPlaylistsTo(syncTarget.text)
+            }
+        }
+
+        Item {
+            objectName: "settingsDeviceSyncStatus"
+            Layout.fillWidth: true
+            implicitHeight: 30
+            Text {
+                x: Ui.space4
+                y: 6
+                width: parent.width - 2 * Ui.space4
+                text: {
+                    var phase = player.deviceSyncPhase
+                    if (phase === "idle") return ""
+                    if (phase === "sending" || phase === "asking") return "正在联系对方…"
+                    if (phase === "done" || phase === "error") return player.deviceSyncMessage
+                    return player.deviceSyncMessage
+                }
+                color: player.deviceSyncPhase === "error" ? Ui.danger : Ui.textSecondary
+                font.pixelSize: Ui.textCallout
+                elide: Text.ElideRight
+                maximumLineCount: 1
+            }
+        }
+    }
+
+    // A pending receiver-side request: exactly one tap and it is applied.
+    Dialog {
+        id: deviceSyncConfirm
+        objectName: "deviceSyncConfirm"
+        title: "来自其他设备的同步请求"
+        Item {
+            implicitWidth: 360
+            implicitHeight: 132
+            height: 132
+            Text {
+                x: Ui.space4
+                y: Ui.space3
+                width: parent.width - 2 * Ui.space4
+                text: (player.deviceSyncRequestFrom || "另一台设备") + " 想要推送本地歌单："
+                      + player.deviceSyncRequestCount + " 个歌单 / "
+                      + player.deviceSyncRequestTracks + " 首歌曲。"
+                color: Ui.textPrimary
+                font.pixelSize: Ui.textCallout
+                wrapMode: Text.WordWrap
+            }
+            Row {
+                x: parent.width - Ui.space4 - childrenRect.width
+                y: parent.height - 46
+                spacing: Ui.space2
+                Button {
+                    type: "standard"
+                    text: "拒绝"
+                    onClicked: { player.rejectDeviceSync(); deviceSyncConfirm.close() }
+                }
+                Button {
+                    objectName: "deviceSyncConfirmApprove"
+                    type: "filled"
+                    text: "允许并合并"
+                    onClicked: { player.approveDeviceSync(); deviceSyncConfirm.close() }
+                }
+            }
+        }
+    }
+
+    Timer {
+        objectName: "deviceSyncRequestPoller"
+        interval: 700
+        repeat: true
+        running: player.deviceSyncRunning
+        onTriggered: {
+            player.refreshDeviceSyncRequest()
+            if (player.deviceSyncRequestFrom !== "" && !deviceSyncConfirm.opened) {
+                deviceSyncConfirm.open()
+            }
+        }
+    }
+
     // ---- Catalog groups -----------------------------------------------------------
     Repeater {
         model: panel.groups
