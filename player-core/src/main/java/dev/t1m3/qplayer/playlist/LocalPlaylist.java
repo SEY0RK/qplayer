@@ -44,6 +44,9 @@ public final class LocalPlaylist {
     public boolean sortDescending;
     public List<PlaylistTrack> tracks = new ArrayList<>();
     public List<PlaylistSubscription> subscriptions = new ArrayList<>();
+    /** Songs removed from this playlist. Kept so a device sync can propagate the
+     *  removal instead of merging the song back from an older snapshot. */
+    public List<TrackTombstone> tombstones = new ArrayList<>();
 
     /** The stored order: what the user arranged, and where subscriptions sit. */
     public static final String SORT_CUSTOM = "";
@@ -320,8 +323,10 @@ public final class LocalPlaylist {
         }
         if (tracks == null) tracks = new ArrayList<>();
         if (subscriptions == null) subscriptions = new ArrayList<>();
+        if (tombstones == null) tombstones = new ArrayList<>();
         subscriptions.removeIf(s -> s == null || s.sourcePlaylistId == null
                 || s.sourcePlaylistId.isEmpty());
+        tombstones.removeIf(t -> t == null || t.mediaId == null || t.mediaId.isEmpty());
 
         Set<String> seen = new HashSet<>();
         List<PlaylistTrack> kept = new ArrayList<>(tracks.size());

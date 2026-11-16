@@ -25,7 +25,9 @@ import java.util.List;
  */
 public final class LocalPlaylistStore {
 
-    private static final int SCHEMA = 1;
+    /** 2 adds playlist-level deletion records for device sync. Schema 1 files
+     *  are still read and get an empty deletion list. */
+    private static final int SCHEMA = 2;
     /** The single mixed list this feature grew out of. Its songs become the first
      *  local playlist the first time the new store loads. */
     private static final String LEGACY_FILE = "custom-playlist.json";
@@ -34,6 +36,8 @@ public final class LocalPlaylistStore {
     private final Path file;
     private final Path legacyFile;
     private final List<LocalPlaylist> playlists = new ArrayList<>();
+    /** Whole playlists removed here, so another device can learn about it. */
+    private final List<PlaylistTombstone> deletedPlaylists = new ArrayList<>();
     private boolean dirty;
     private boolean loaded;
     private Exception readFailure;
@@ -62,7 +66,8 @@ public final class LocalPlaylistStore {
                     throw new java.io.IOException("missing local playlists state fields");
                 }
                 State state = gson.fromJson(root, State.class);
-                if (state == null || state.schemaVersion != SCHEMA || state.items == null) {
+                if (state == null || state.schemaVersion < 1 || state.schemaVersion > SCHEMA
+                        || state.items == null) {
                     throw new java.io.IOException("invalid local playlists state");
                 }
                 List<LocalPlaylist> restored = new ArrayList<>();
@@ -73,8 +78,17 @@ public final class LocalPlaylistStore {
                 }
                 playlists.clear();
                 playlists.addAll(restored);
+                deletedPlaylists.clear();
+                if (state.deletedPlaylists != null) {
+                    for (PlaylistTombstone tombstone : state.deletedPlaylists) {
+                        if (tombstone == null || tombstone.id == null || tombstone.id.isEmpty()) continue;
+                        deletedPlaylists.add(tombstone);
+                    }
+                }
                 loaded = true;
                 readFailure = null;
+                // A schema 1 file has no deletion list; persist the upgrade once.
+                if (state.schemaVersion < SCHEMA) dirty = true;
                 return;
             }
         } catch (Exception error) {
@@ -174,8 +188,39 @@ public final class LocalPlaylistStore {
     public synchronized boolean delete(String id) {
         requireWritable();
         boolean removed = playlists.removeIf(p -> p.id.equals(id));
-        if (removed) dirty = true;
+        if (removed) {
+            long now = System.currentTimeMillis();
+            deletedPlaylists.removeIf(t -> t.id.equals(id));
+            deletedPlaylists.add(new PlaylistTombstone(id, now));
+            dirty = true;
+        }
         return removed;
+    }
+
+    /** Snapshot of this device's playlists and deletions, for the sender side
+     *  of a device sync. Detached: the caller may serialize it off-thread. */
+    public synchronized PlaylistSyncSnapshot snapshot() {
+        return new PlaylistSyncSnapshot(all(), new ArrayList<>(deletedPlaylists));
+    }
+
+    /** Merge a sender's snapshot into this device. Only the sender's deletions
+     *  propagate; deletions made here stay local. Receiver-only playlists and
+     *  songs survive. Call {@link #save()} once the caller is done. */
+    public synchronized PlaylistMerge.Result applySnapshot(PlaylistSyncSnapshot incoming) {
+        requireWritable();
+        if (incoming == null) return new PlaylistMerge.Result();
+        PlaylistMerge.Result result = PlaylistMerge.merge(
+                all(), new ArrayList<>(deletedPlaylists),
+                incoming.playlists, incoming.deletedPlaylists,
+                System.currentTimeMillis());
+        if (result.changed) {
+            playlists.clear();
+            playlists.addAll(result.playlists);
+            deletedPlaylists.clear();
+            deletedPlaylists.addAll(result.deletedPlaylists);
+            dirty = true;
+        }
+        return result;
     }
 
     public synchronized boolean rename(String id, String name) {
@@ -233,6 +278,7 @@ public final class LocalPlaylistStore {
         try {
             State state = new State();
             state.items = new ArrayList<>(playlists);
+            state.deletedPlaylists = new ArrayList<>(deletedPlaylists);
             StorageFiles.writeUtf8Atomic(file, gson.toJson(state));
             dirty = false;
             return true;
@@ -352,5 +398,6 @@ public final class LocalPlaylistStore {
     private static final class State {
         int schemaVersion = SCHEMA;
         List<LocalPlaylist> items = new ArrayList<>();
+        List<PlaylistTombstone> deletedPlaylists = new ArrayList<>();
     }
 }
