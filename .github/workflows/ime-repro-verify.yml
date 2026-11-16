@@ -60,7 +60,10 @@ jobs:
           mvn -B -pl desktop-host compiler:testCompile
 
       - name: Run playlist sync merge tests
-        run: mvn -B -pl player-core test -Dtest=PlaylistMergeTest -DfailIfNoTests=true
+        run: |
+          mvn -B -pl player-core dependency:build-classpath -Dmdep.outputFile=target/test-cp.txt -Dmdep.includeScope=test -q
+          CP="player-core/target/classes:player-core/target/test-classes:$(cat player-core/target/test-cp.txt)"
+          java -cp "$CP" dev.t1m3.qplayer.playlist.PlaylistMergeTest
 
       - name: Validate all workflow YAML files
         run: |
