@@ -106,7 +106,7 @@ public class PlaylistMergeTest {
                 track("netease:song:1", 10L), track("netease:song:2", 11L));
         LocalPlaylist theirs = playlist("local:playlist:a", "Mine", 200L,
                 track("netease:song:1", 10L));
-        theirs.tombstones.add(new TrackTombstone("netease:song:2", 190L));
+        theirs.tombstones.add(new TrackTombstone("netease:song:2", NOW - 10L));
 
         PlaylistMerge.Result result = merge(list(mine), Collections.<PlaylistTombstone>emptyList(),
                 list(theirs), Collections.<PlaylistTombstone>emptyList());
@@ -120,7 +120,7 @@ public class PlaylistMergeTest {
     public void receiverTrackDeletionDoesNotPropagateToSenderButSurvivesLocally() {
         LocalPlaylist mine = playlist("local:playlist:a", "Mine", 100L,
                 track("netease:song:1", 10L));
-        mine.tombstones.add(new TrackTombstone("netease:song:2", 150L));
+        mine.tombstones.add(new TrackTombstone("netease:song:2", NOW - 50L));
         // Sender still has song 2 — it never learned about the receiver's delete.
         LocalPlaylist theirs = playlist("local:playlist:a", "Mine", 200L,
                 track("netease:song:1", 10L), track("netease:song:2", 11L));
@@ -139,8 +139,8 @@ public class PlaylistMergeTest {
     public void songAddedAfterDeletionIsRevived() {
         LocalPlaylist mine = playlist("local:playlist:a", "Mine", 100L);
         LocalPlaylist theirs = playlist("local:playlist:a", "Mine", 200L,
-                track("netease:song:9", 300L));
-        theirs.tombstones.add(new TrackTombstone("netease:song:9", 100L));
+                track("netease:song:9", NOW));
+        theirs.tombstones.add(new TrackTombstone("netease:song:9", NOW - 100L));
 
         PlaylistMerge.Result result = merge(list(mine), Collections.<PlaylistTombstone>emptyList(),
                 list(theirs), Collections.<PlaylistTombstone>emptyList());
@@ -153,7 +153,7 @@ public class PlaylistMergeTest {
     public void senderPlaylistDeletionPropagates() {
         LocalPlaylist mine = playlist("local:playlist:a", "Mine", 100L,
                 track("netease:song:1", 10L));
-        PlaylistTombstone deletion = new PlaylistTombstone("local:playlist:a", 190L);
+        PlaylistTombstone deletion = new PlaylistTombstone("local:playlist:a", NOW - 10L);
 
         PlaylistMerge.Result result = merge(list(mine), Collections.<PlaylistTombstone>emptyList(),
                 Collections.<LocalPlaylist>emptyList(), Collections.singletonList(deletion));
@@ -166,7 +166,7 @@ public class PlaylistMergeTest {
     @Test
     public void receiverPlaylistDeletionDoesNotRemoveSendersCopy() {
         LocalPlaylist mine = playlist("local:playlist:a", "Mine", 100L);
-        PlaylistTombstone localDeletion = new PlaylistTombstone("local:playlist:a", 150L);
+        PlaylistTombstone localDeletion = new PlaylistTombstone("local:playlist:a", NOW - 50L);
         LocalPlaylist theirs = playlist("local:playlist:a", "Mine", 200L,
                 track("netease:song:1", 10L));
 
@@ -180,7 +180,7 @@ public class PlaylistMergeTest {
     @Test
     public void localDeletionShieldsOlderSendersCopy() {
         LocalPlaylist mine = playlist("local:playlist:a", "Mine", 100L);
-        PlaylistTombstone localDeletion = new PlaylistTombstone("local:playlist:a", 400L);
+        PlaylistTombstone localDeletion = new PlaylistTombstone("local:playlist:a", NOW + 400L);
         LocalPlaylist theirs = playlist("local:playlist:a", "Old", 200L,
                 track("netease:song:1", 10L));
 
@@ -247,9 +247,9 @@ public class PlaylistMergeTest {
     public void clockSkewToleranceKeepsRecentReAdd() {
         LocalPlaylist mine = playlist("local:playlist:a", "Mine", 100L);
         LocalPlaylist theirs = playlist("local:playlist:a", "Mine", 200L,
-                track("netease:song:1", 100L));
-        // Sender's clock is two minutes ahead of the addition timestamp.
-        theirs.tombstones.add(new TrackTombstone("netease:song:1", 150L));
+                track("netease:song:1", NOW + 60_000L));
+        // Addition is newer than the sender's deletion record.
+        theirs.tombstones.add(new TrackTombstone("netease:song:1", NOW - 50L));
 
         PlaylistMerge.Result result = merge(list(mine), Collections.<PlaylistTombstone>emptyList(),
                 list(theirs), Collections.<PlaylistTombstone>emptyList());
