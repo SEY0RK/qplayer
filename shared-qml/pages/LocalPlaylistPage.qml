@@ -42,6 +42,8 @@ Rectangle {
     }
 
     property string filterText: ""
+    property string syncTargetText: ""
+    property bool syncDialogOpen: false
     property var filteredTracks: {
         var all = page.tracksList
         if (!all) return all
@@ -615,6 +617,7 @@ Rectangle {
         title: "设备同步"
         showAcceptButton: false
         rejectText: "关闭"
+        onOpenedChanged: page.syncDialogOpen = opened
 
         Column {
             width: deviceSyncDialog.contentWidth
@@ -634,8 +637,7 @@ Rectangle {
                     }
                 }
                 Text {
-                    width: parent.width - receiveToggle.width - parent.spacing
-                    y: (receiveToggle.height - height) / 2
+                    width: parent.width - parent.spacing - 96
                     text: player.deviceSyncRunning
                         ? ("接收中 · " + player.deviceSyncLocalAddress
                            + ":" + player.deviceSyncPort)
@@ -681,6 +683,8 @@ Rectangle {
                 leadingIcon: "link"
                 width: parent.width
                 height: implicitHeight
+                text: page.syncTargetText
+                onTextChanged: page.syncTargetText = text
             }
 
             Button {
@@ -690,7 +694,7 @@ Rectangle {
                 text: "推送全部"
                 enabled: player.deviceSyncPhase === "idle"
                          || player.deviceSyncPhase === "done"
-                onClicked: player.sendLocalPlaylistsTo(deviceSyncTarget.text)
+                onClicked: player.sendLocalPlaylistsTo(page.syncTargetText)
             }
 
             Rectangle {
@@ -726,7 +730,7 @@ Rectangle {
         Timer {
             interval: 700
             repeat: true
-            running: deviceSyncDialog.opened && player.deviceSyncRunning
+            running: page.syncDialogOpen && player.deviceSyncRunning
             onTriggered: {
                 player.refreshDeviceSyncDevices()
                 reloadSyncDevices()
