@@ -15,6 +15,15 @@ on:
         description: Version label for this build
         required: false
         default: '2.1.1-local.1'
+      publish:
+        description: Publish the packages to GitHub Releases
+        type: boolean
+        required: false
+        default: false
+      source_run_id:
+        description: Publish artifacts from an existing run id (skips rebuilding)
+        required: false
+        default: ''
 permissions:
   contents: read
 concurrency:
@@ -23,6 +32,7 @@ concurrency:
 
 jobs:
   ime-guard:
+    if: inputs.source_run_id == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +44,7 @@ jobs:
         run: python -c "import json; c=json.load(open('.github/ime-guard.json')); assert c['engine_ref']=='v0.2.39-ime' and c['engine_version']=='v0.2.39'; print('engine pin OK:', c['engine_repo'], c['engine_ref'])"
 
   android:
+    if: inputs.source_run_id == ''
     needs: ime-guard
     runs-on: ubuntu-latest
     steps:
@@ -106,6 +117,7 @@ jobs:
         with: { name: QPlayer-android, path: out/* }
 
   windows-portable:
+    if: inputs.source_run_id == ''
     needs: ime-guard
     runs-on: windows-latest
     steps:
@@ -154,6 +166,7 @@ jobs:
           path: desktop-host/target/QPlayer-windows-x64-portable.zip
 
   bundle:
+    if: inputs.source_run_id == ''
     # One artifact with both packages, so a single download is enough.
     needs: [android, windows-portable]
     runs-on: ubuntu-latest
@@ -169,15 +182,21 @@ jobs:
           path: dist/*
 
   release:
-    # Publish only after both packages are built and verified.
-    needs: bundle
+    # Publish only when explicitly requested. With source_run_id set, this
+    # reuses an existing artifact and skips every build job.
+    if: inputs.publish || github.event_name == 'push'
+    needs: [bundle]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: read
     steps:
       - uses: actions/download-artifact@v4
-        with: { name: QPlayer-local-build, path: dist }
+        with:
+          name: QPlayer-local-build
+          path: dist
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Prepare release notes
         env:
           VERSION: ${{ inputs.version || github.ref_name }}
