@@ -119,6 +119,33 @@ public class PlaylistSyncTransportTest {
     }
 
     @Test
+    public void multiBytePayloadArrivesUnchanged() throws Exception {
+        MemoryStore store = new MemoryStore();
+        PlaylistSyncServer server = new PlaylistSyncServer(store, "dev-recv", "接收端",
+                "test", (action, remote, plan) -> true);
+        assertTrue(server.start());
+        try {
+            MemoryStore sender = new MemoryStore();
+            LocalPlaylist kept = playlist("local:playlist:a", "中文歌单 · 带标点和 emoji 🎧");
+            for (int i = 0; i < 2000; i++) {
+                kept.tracks.add(track("netease:song:" + i));
+            }
+            sender.playlists.add(kept);
+            PlaylistSyncClient client = new PlaylistSyncClient("dev-send", "发送端");
+            PlaylistSyncClient.Address address =
+                    PlaylistSyncClient.parseAddress("127.0.0.1:" + server.port(), 39890);
+            assertTrue(client.requestApproval(address, sender.snapshot()));
+            PlaylistSyncProtocol.ApplyResult result = client.send(address, sender.snapshot());
+            assertTrue(result.ok);
+            assertEquals(1, store.playlists.size());
+            assertEquals("中文歌单 · 带标点和 emoji 🎧", store.playlists.get(0).name);
+            assertEquals(2000, ids(store.playlists.get(0)).size());
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
     public void rejectionPreventsApply() throws Exception {
         MemoryStore store = new MemoryStore();
         PlaylistSyncServer server = new PlaylistSyncServer(store, "dev-recv", "Receiver",
