@@ -48,6 +48,7 @@ public final class PlaylistSyncProtocol {
     /** Summary sent before the payload so the receiver can ask the user. */
     public static final class Plan {
         public String format = FORMAT;
+        public int formatVersion = FORMAT_VERSION;
         public String deviceId = "";
         public String deviceName = "";
         public int playlistCount;
@@ -64,6 +65,7 @@ public final class PlaylistSyncProtocol {
     /** The actual transfer. Carries the full snapshot so one POST is enough. */
     public static final class Payload {
         public String format = FORMAT;
+        public int formatVersion = FORMAT_VERSION;
         public String deviceId = "";
         public String deviceName = "";
         public List<LocalPlaylist> playlists = new ArrayList<LocalPlaylist>();
