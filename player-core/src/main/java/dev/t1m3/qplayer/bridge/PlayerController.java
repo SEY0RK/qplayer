@@ -42,6 +42,7 @@ import dev.t1m3.qplayer.playlist.PlaylistStoreAccess;
 import dev.t1m3.qplayer.sync.DeviceSyncState;
 import dev.t1m3.qplayer.sync.PlaylistSyncClient;
 import dev.t1m3.qplayer.sync.PlaylistSyncProtocol;
+import dev.t1m3.qplayer.sync.SyncDiscovery;
 import dev.t1m3.qplayer.sync.SyncException;
 import dev.t1m3.qplayer.playlist.MyPlaylistOrderStore;
 import dev.t1m3.qplayer.playlist.PlaylistSubscription;
@@ -851,6 +852,8 @@ public final class PlayerController {
     public final Property<String> deviceSyncRequestFrom = new Property<>("");
     public final Property<Integer> deviceSyncRequestCount = new Property<>(0);
     public final Property<Integer> deviceSyncRequestTracks = new Property<>(0);
+    /** LAN peers as a JSON array, refreshed by the settings page poller. */
+    public final Property<String> deviceSyncDevicesJson = new Property<>("[]");
 
     // --- Account ----------------------------------------------------------
     public final Property<Boolean> loggedIn = new Property<>(false);
@@ -5347,6 +5350,7 @@ public final class PlayerController {
                 deviceSyncRequestCount.set(0);
                 deviceSyncRequestTracks.set(0);
                 deviceSyncPhase.set("idle");
+                deviceSyncDevicesJson.set("[]");
             });
         });
     }
@@ -5421,6 +5425,32 @@ public final class PlayerController {
         deviceSyncRequestFrom.set(request.deviceName == null ? "" : request.deviceName);
         deviceSyncRequestCount.set(request.playlistCount);
         deviceSyncRequestTracks.set(request.trackCount);
+    }
+
+    /** Refreshes the LAN peer list bound by the settings page. */
+    public void refreshDeviceSyncDevices() {
+        deviceSyncDevicesJson.set(new Gson().toJson(deviceSyncState.devices()));
+    }
+
+    /** One-tap push to a peer found by LAN discovery. */
+    public void sendLocalPlaylistsToDevice(String deviceId) {
+        SyncDiscovery.DeviceInfo target = null;
+        if (deviceId != null) {
+            for (SyncDiscovery.DeviceInfo peer : deviceSyncState.devices()) {
+                if (deviceId.equals(peer.deviceId)) {
+                    target = peer;
+                    break;
+                }
+            }
+        }
+        if (target == null) {
+            onHost(() -> {
+                deviceSyncPhase.set("error");
+                deviceSyncMessage.set("该设备已离线，请重新选择");
+            });
+            return;
+        }
+        sendLocalPlaylistsTo(target.host + ":" + target.port);
     }
 
     private void refreshLocalPlaylistsAfterSync() {

@@ -218,6 +218,25 @@ ColumnLayout {
     }
 
     // ---- Device sync (local playlists) ----------------------------------------
+    ListModel { id: syncDevicesModel }
+
+    function reloadSyncDevices() {
+        var peers
+        try { peers = JSON.parse(player.deviceSyncDevicesJson || "[]") }
+        catch (e) { peers = [] }
+        syncDevicesModel.clear()
+        for (var i = 0; i < peers.length; ++i) {
+            var p = peers[i]
+            syncDevicesModel.append({
+                deviceId: p.deviceId || "",
+                deviceName: p.deviceName || "未知设备",
+                host: p.host || "",
+                port: p.port || 0,
+                platform: p.platform || ""
+            })
+        }
+    }
+
     SettingCard {
         objectName: "settingsDeviceSyncCard"
         Layout.fillWidth: true
@@ -277,6 +296,39 @@ ColumnLayout {
                 text: "推送全部"
                 enabled: player.deviceSyncPhase === "idle" || player.deviceSyncPhase === "done"
                 onClicked: player.sendLocalPlaylistsTo(syncTarget.text)
+            }
+        }
+
+        Item {
+            objectName: "settingsDeviceSyncNearby"
+            Layout.fillWidth: true
+            implicitHeight: nearbyColumn.implicitHeight
+            Column {
+                id: nearbyColumn
+                width: parent.width
+                spacing: Ui.space2
+                Text {
+                    text: "附近设备（需先开启接收）"
+                    color: Ui.textSecondary
+                    font.pixelSize: Ui.textCallout
+                }
+                Repeater {
+                    model: syncDevicesModel
+                    delegate: Button {
+                        objectName: "settingsDeviceSyncPeer"
+                        width: nearbyColumn.width
+                        type: "standard"
+                        text: (model.deviceName || "设备") + " · "
+                              + model.host + ":" + model.port
+                        onClicked: player.sendLocalPlaylistsToDevice(model.deviceId)
+                    }
+                }
+                Text {
+                    visible: syncDevicesModel.count === 0
+                    text: "未发现设备；也可在上方手动输入地址"
+                    color: Ui.textSecondary
+                    font.pixelSize: Ui.textCallout
+                }
             }
         }
 
@@ -349,6 +401,8 @@ ColumnLayout {
         running: player.deviceSyncRunning
         onTriggered: {
             player.refreshDeviceSyncRequest()
+            player.refreshDeviceSyncDevices()
+            reloadSyncDevices()
             if (player.deviceSyncRequestFrom !== "" && !deviceSyncConfirm.opened) {
                 deviceSyncConfirm.open()
             }

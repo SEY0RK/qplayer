@@ -7,6 +7,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
 
 /** Device identity and the pending-request handshake shared with QML. */
@@ -18,6 +20,7 @@ public final class DeviceSyncState {
     private volatile String platform = "";
     private volatile PlaylistSyncServer server;
     private volatile boolean serverRunning;
+    private volatile SyncDiscovery discovery;
 
     /** A request awaiting this device's approval; null when none. */
     private volatile PlaylistSyncProtocol.Plan pending;
@@ -149,6 +152,13 @@ public final class DeviceSyncState {
         if (!created.start()) return false;
         server = created;
         serverRunning = true;
+
+        SyncDiscovery found = new SyncDiscovery();
+        if (found.start(deviceId, deviceName, platform, created.port())) {
+            discovery = found;
+        } else {
+            Logger.warn("LAN discovery unavailable; manual address still works");
+        }
         return true;
     }
 
@@ -156,7 +166,17 @@ public final class DeviceSyncState {
         PlaylistSyncServer current = server;
         server = null;
         serverRunning = false;
+        SyncDiscovery currentDiscovery = discovery;
+        discovery = null;
+        if (currentDiscovery != null) currentDiscovery.stop();
         if (current != null) current.stop();
         reject();
+    }
+
+    /** Peers currently visible on the LAN (empty when the receiver is off). */
+    public List<SyncDiscovery.DeviceInfo> devices() {
+        SyncDiscovery current = discovery;
+        return current == null ? Collections.<SyncDiscovery.DeviceInfo>emptyList()
+                : current.devices();
     }
 }
