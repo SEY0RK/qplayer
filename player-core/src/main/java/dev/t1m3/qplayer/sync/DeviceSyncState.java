@@ -1,5 +1,6 @@
 package dev.t1m3.qplayer.sync;
 
+import dev.t1m3.qplayer.playlist.PlaylistStoreAccess;
 import dev.t1m3.qplayer.util.Logger;
 
 import java.io.IOException;
