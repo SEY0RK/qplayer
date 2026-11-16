@@ -1,84 +1,85 @@
-name: ime-repro-verify
-# Manual only. Verifies that the Windows IME repro on local-v2 compiles
-# against the patched qml4j 0.2.39 engine.
-on:
-  push:
-    branches: [local-v2]
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: Branch to verify
-        required: false
-        default: local-v2
-permissions:
-  contents: read
-jobs:
-  verify:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout QPlayer
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
-
-      - name: Checkout patched qml4j 0.2.39
-        uses: actions/checkout@v4
-        with:
-          repository: SEY0RK/qml4j-ime
-          ref: v0.2.39-ime
-          token: ${{ secrets.QML4J_IME_REPO_TOKEN }}
-          path: engine/qml4j-ime
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-          cache: maven
-
-      - name: Install Linux WebView build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake pkg-config build-essential zlib1g-dev libgtk-3-dev \
-            libwebkit2gtk-4.1-dev libx11-dev
-
-      - name: Install patched qml4j into local Maven repo
-        run: bash .github/scripts/install-qml4j-ime.sh
-
-      - name: Build reactor prerequisites
-        run: |
-          mvn -B -N install
-          mvn -B -Dmaven.test.skip=true -pl player-core,qml-aot-tool -am install
-
-      - name: Compile desktop-host IME sources
-        run: mvn -B -Dmaven.test.skip=true -pl desktop-host compile
-
-      - name: Compile reproduced feature tests
-        run: |
-          mvn -B -pl player-core compiler:testCompile
-          mvn -B -pl desktop-host compiler:testCompile
-
+name: ime-repro-verify
+# Manual only. Verifies that the Windows IME repro on local-v2 compiles
+# against the patched qml4j 0.2.39 engine.
+on:
+  push:
+    branches: [local-v2]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch to verify
+        required: false
+        default: local-v2
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout QPlayer
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Checkout patched qml4j 0.2.39
+        uses: actions/checkout@v4
+        with:
+          repository: SEY0RK/qml4j-ime
+          ref: v0.2.39-ime
+          token: ${{ secrets.QML4J_IME_REPO_TOKEN }}
+          path: engine/qml4j-ime
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Install Linux WebView build dependencies
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config build-essential zlib1g-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libx11-dev
+
+      - name: Install patched qml4j into local Maven repo
+        run: bash .github/scripts/install-qml4j-ime.sh
+
+      - name: Build reactor prerequisites
+        run: |
+          mvn -B -N install
+          mvn -B -Dmaven.test.skip=true -pl player-core,qml-aot-tool -am install
+
+      - name: Compile desktop-host IME sources
+        run: mvn -B -Dmaven.test.skip=true -pl desktop-host compile
+
+      - name: Compile reproduced feature tests
+        run: |
+          mvn -B -pl player-core compiler:testCompile
+          mvn -B -pl desktop-host compiler:testCompile
+
       - name: Run playlist sync merge tests
         run: mvn -B -pl player-core test -Dtest=PlaylistMergeTest -DfailIfNoTests=true
 
-      - name: Validate all workflow YAML files
-        run: |
-          python -m pip install --quiet pyyaml
-          python -c "import yaml, glob; fs=glob.glob('.github/workflows/*.yml'); [yaml.safe_load(open(f, encoding='utf-8')) for f in fs]; print('workflow YAML OK:', fs)"
-
-      - name: Verify IME baseline guard
-        run: python .github/scripts/verify-ime-baseline.py
-
-      - name: Compile Android perf variant
-        if: contains(github.event.head_commit.message, 'gradle-verify')
-        run: |
-          chmod +x android-shell/gradlew
-          cd android-shell && ./gradlew --no-daemon :app:assemblePerf
-
-      - name: Assert both IME implementations are present
-        run: |
-          test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/ImeBridge.class
-          test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/ImePositioner.class
-          test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/ImeDiagnostics.class
-          test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/WinIme.class
-          echo "IME repro compiled: single-writer positioner + upstream WinIme coexist"
+      - name: Validate all workflow YAML files
+        run: |
+          python -m pip install --quiet pyyaml
+          python -c "import yaml, glob; fs=glob.glob('.github/workflows/*.yml'); [yaml.safe_load(open(f, encoding='utf-8')) for f in fs]; print('workflow YAML OK:', fs)"
+
+      - name: Verify IME baseline guard
+        run: python .github/scripts/verify-ime-baseline.py
+
+      - name: Compile Android perf variant
+        if: contains(github.event.head_commit.message, 'gradle-verify')
+        run: |
+          chmod +x android-shell/gradlew
+          cd android-shell && ./gradlew --no-daemon :app:assemblePerf
+
+      - name: Assert both IME implementations are present
+        run: |
+          test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/ImeBridge.class
+          test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/ImePositioner.class
+          test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/ImeDiagnostics.class
+          test -f desktop-host/target/classes/dev/t1m3/qplayer/desktop/window/WinIme.class
+          echo "IME repro compiled: single-writer positioner + upstream WinIme coexist"
