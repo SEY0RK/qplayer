@@ -64,6 +64,7 @@ jobs:
           mvn -B -pl player-core dependency:build-classpath -Dmdep.outputFile=target/test-cp.txt -Dmdep.includeScope=test -q
           CP="player-core/target/classes:player-core/target/test-classes:$(cat player-core/target/test-cp.txt)"
           java -cp "$CP" dev.t1m3.qplayer.playlist.PlaylistMergeTest
+          java -cp "$CP" dev.t1m3.qplayer.sync.PlaylistSyncTransportTest
 
       - name: Validate all workflow YAML files
         run: |
