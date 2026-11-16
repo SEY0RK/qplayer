@@ -146,7 +146,10 @@ public final class PlaylistMerge {
         for (PlaylistTrack track : other.tracks) {
             if (track == null || !track.valid()) continue;
             if (mergedTracks.containsKey(track.mediaId)) continue;
-            if (isDeleted(track, remoteTrackDeleted) || isDeleted(track, localTrackDeleted)) continue;
+            if (isDeleted(track, remoteTrackDeleted) || isDeleted(track, localTrackDeleted)) {
+                result.removedTracks++;
+                continue;
+            }
             mergedTracks.put(track.mediaId, copyTrack(track));
             result.addedTracks++;
         }
@@ -212,7 +215,10 @@ public final class PlaylistMerge {
     private static boolean isDeleted(PlaylistTrack track, Map<String, Long> deletions) {
         Long removedAt = deletions.get(track.mediaId);
         if (removedAt == null) return false;
-        return removedAt + CLOCK_TOLERANCE_MS >= track.addedAtMs;
+        // A song added again after the removal wins. The tolerance only covers
+        // two clocks disagreeing about *when* the removal happened; it must not
+        // reach forward and delete a later re-add.
+        return removedAt > track.addedAtMs || Math.abs(removedAt - track.addedAtMs) < 1L;
     }
 
     private static Map<String, Long> trackTombstones(List<TrackTombstone> tombstones) {
