@@ -8795,6 +8795,11 @@ public final class PlayerController {
             subscribeBusy = true;
             if (id.toString().equals(openSourcePlaylistId.peek()))
                 playlistSubscribed.set(subscribed);
+            // 我的 is built from user/playlist, so a fresh collect would not show up
+            // until that round trip (and, on a risk-controlled source, until its
+            // anti-cheat probe) finishes — which reads as the tap doing nothing.
+            // Mirror it into the grid now; loadMyPlaylists() reconciles right after.
+            rememberPlaylistSubscription(id, subscribed);
             pluginProviders
                     .mutatePlaylist(
                             id,
@@ -8821,6 +8826,10 @@ public final class PlayerController {
                                                 } else {
                                                     if (stillOpen)
                                                         playlistSubscribed.set(!subscribed);
+                                                    // Drop the optimistic grid row the same
+                                                    // way it was added: by re-reading the
+                                                    // authoritative list, not by guessing.
+                                                    loadMyPlaylists();
                                                     showToast(
                                                             I18n.tr(
                                                                     "toast.actionFailed",
@@ -8828,6 +8837,53 @@ public final class PlayerController {
                                                 }
                                             }));
         }
+    }
+
+    /**
+     * Mirror a collect / un-collect into 我的 before the server answers.
+     *
+     * <p>The grid is rebuilt from the provider's {@code user/playlist}, which is a
+     * network round trip — and on a risk-controlled source it also waits behind the
+     * anti-cheat probe. Until it lands the library keeps showing the pre-tap list,
+     * which reads as the button having done nothing, most visibly when the user goes
+     * straight back to 我的 after tapping. This is the same optimistic flip the detail
+     * page's bookmark icon already does; a failure re-reads the authoritative list.
+     */
+    private void rememberPlaylistSubscription(MediaId id, boolean subscribed) {
+        String provider = id.provider();
+        List<Playlist> existing = myPlaylistsBySource.get(provider);
+        if (existing == null && !subscribed) return;
+        List<Playlist> next =
+                new ArrayList<>(
+                        existing != null ? existing : Collections.<Playlist>emptyList());
+        if (subscribed) {
+            for (Playlist playlist : next) {
+                if (id.toString().equals(playlist.id)) return;
+            }
+            Playlist row = new Playlist();
+            row.id = id.toString();
+            row.name = orEmpty(playlistTitle.peek());
+            row.artworkUrl = orEmpty(playlistCoverPath.peek());
+            row.coverUrl = row.artworkUrl;
+            row.trackCount =
+                    sourcePlaylistTracks.peek() != null ? sourcePlaylistTracks.peek().size() : 0;
+            row.sourceName = pluginDisplayName(provider);
+            row.subscribed = true;
+            // Appended, never prepended: a source lists the playlists you created
+            // before the ones you collected, and this row belongs to the second group.
+            next.add(row);
+        } else {
+            boolean removed = false;
+            for (int i = next.size() - 1; i >= 0; i--) {
+                if (id.toString().equals(next.get(i).id)) {
+                    next.remove(i);
+                    removed = true;
+                }
+            }
+            if (!removed) return;
+        }
+        myPlaylistsBySource.put(provider, next);
+        publishMyPlaylists();
     }
 
     /** Per-source slices of 我的, keyed by provider id. Main thread only. */
