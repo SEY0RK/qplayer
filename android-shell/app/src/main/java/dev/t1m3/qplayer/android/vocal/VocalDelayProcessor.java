@@ -40,8 +40,6 @@ public final class VocalDelayProcessor implements AudioProcessor {
     private static final int MAX_QUEUE = 16;
     /** Applied at the top of queueInput (audio thread) to avoid cross-thread ring edits. */
     private volatile long pendingSkipTo = -1;
-    /** Maximum windows to run per audio block; keeps any single call well under a buffer. */
-    private static final int MAX_DRAIN_PER_BLOCK = 2;
 
     // ---- configuration ---------------------------------------------------
     private volatile int delayFrames = 66_150;        // 1.5 s @ 44.1 kHz, refined at runtime
@@ -374,14 +372,14 @@ public final class VocalDelayProcessor implements AudioProcessor {
                 // Calibration runs on its own thread/engine (startCalibration) so the
                 // audio path never blocks here.
                 //
-                // Drain UNCONDITIONALLY, but cap the count: leaving blocks inside the
-                // engine overruns its input ring (positional holes), while draining
-                // unbounded can exceed the hardware buffer. Two windows ≈ 0.7 s worst
-                // case, and steady state only ever has one ready.
+                // Drain COMPLETELY, every block. Capping the count (an earlier attempt)
+                // made the engine fall permanently behind: any block that needed more
+                // than the cap left a residue, the residue grew, the input ring
+                // overran, positions developed holes and playback stuttered forever.
+                // Steady state only ever has one window ready, so this does not
+                // lengthen the average call — it just refuses to fall behind.
                 StreamingSeparator.Segment seg;
-                int drained = 0;
-                while (drained < MAX_DRAIN_PER_BLOCK && (seg = eng.poll()) != null) {
-                    drained++;
+                while ((seg = eng.poll()) != null) {
                     if (seg.endFrame() <= outputCursor) continue;   // already played past
                     while (queue.size() >= MAX_QUEUE) queue.pollFirst();
                     queue.addLast(seg);
