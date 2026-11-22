@@ -131,7 +131,26 @@ public final class VocalMixingProcessor {
                 || !separator.isSupported();
 
         if (bypass) {
-            // True raw-PCM passthrough: nothing reads or writes pcm[] here.
+            // True raw-PCM passthrough: nothing writes pcm[] here.
+            boolean passthrough = VocalMixMath.isPassthrough(slider);
+            if (passthrough && enabled && separator.isReady()
+                    && separator.mixesInternally()) {
+                // Shadow-run the separator at centre: its output equals the original
+                // mix, so we discard it, but the 0.7 s window stays primed and
+                // dragging straight back out takes effect immediately instead of
+                // re-priming (which sounded like the track restarting).
+                if (vocalScratch.length < n) vocalScratch = new short[n];
+                try {
+                    separator.separate(pcm, 0, vocalScratch, 0, frames, channels);
+                    state = VocalProcessorState.READY;
+                } catch (Throwable t) {
+                    state = VocalProcessorState.DEGRADED;
+                }
+            } else if (!enabled || passthrough) {
+                // Reflect the real reason so the UI stops reporting "separating"
+                // once the slider is back at centre or separation was switched off.
+                state = VocalProcessorState.DISABLED;
+            }
             fallbackFrames.addAndGet(frames);
             return;
         }

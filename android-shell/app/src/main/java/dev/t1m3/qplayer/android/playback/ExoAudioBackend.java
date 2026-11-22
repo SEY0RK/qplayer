@@ -87,6 +87,8 @@ public final class ExoAudioBackend implements AudioBackend {
     private final VocalMixingProcessor mixer;
     private final VocalExoAudioProcessor vocalProcessor;
     private volatile boolean vocalEnabled;
+    /** True once the user has moved the slider off centre at least once. */
+    private volatile boolean vocalEverUsed;
 
     private final Runnable positionPoll = new Runnable() {
         @Override public void run() {
@@ -352,15 +354,18 @@ public final class ExoAudioBackend implements AudioBackend {
     @Override
     public void setVocalMix(final int percent) {
         final int clamped = Math.max(0, Math.min(100, percent));
-        runOnMain(() -> {
-            float p = clamped / 100f;
-            mixer.setSlider(p);
-            boolean shouldEnable = Math.abs(p - 0.5f) > 0.001f;
-            if (shouldEnable != vocalEnabled) {
-                vocalEnabled = shouldEnable;
-                mixer.setEnabled(shouldEnable);
-            }
-        });
+        float p = clamped / 100f;
+        // Plain volatile store — safe from the UI thread and must land BEFORE the
+        // next audio block, otherwise the slider lags a block behind.
+        mixer.setSlider(p);
+        boolean offCentre = Math.abs(p - 0.5f) > 0.001f;
+        if (offCentre && !vocalEverUsed) {
+            // First real use: build the pipeline. It is deliberately NOT torn down
+            // when the slider returns to centre — the mixer keeps shadow-running
+            // there so its 0.7 s window stays primed and the next drag is instant.
+            vocalEverUsed = true;
+            runOnMain(() -> mixer.setEnabled(true));
+        }
     }
 
     @Override public int vocalState() { return mixer.state().ordinal(); }

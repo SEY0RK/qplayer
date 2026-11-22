@@ -55,6 +55,17 @@ Item {
         z: 99999
         Keys.onEscapePressed: { control.handleBack(); event.accepted = true }
 
+        // Separation state changes on the AUDIO thread a block after the slider
+        // moves, so a single read at open time would latch a stale value (the popup
+        // kept saying "separating" even back at centre). Poll while visible.
+        Timer {
+            id: statePoll
+            interval: 300
+            repeat: true
+            running: overlayLayer.visible
+            onTriggered: player.refreshVocalState()
+        }
+
         MouseArea { anchors.fill: parent; onPressed: control.close() }
 
         Rectangle {
@@ -103,7 +114,9 @@ Item {
                 anchors.right: parent.right
                 anchors.rightMargin: Ui.space4
                 text: !player.vocalSupported ? "不支持"
-                      : (player.vocalState === 3 ? "分离中" : (player.vocalState === 1 || player.vocalState === 2 ? "准备中" : "原声"))
+                      : (player.vocalState === 3 ? "分离中"
+                      : (player.vocalState === 1 ? "准备中"
+                      : (player.vocalState === 4 ? "已降级" : "原声")))
                 color: player.vocalState === 4 ? Ui.danger : Ui.textSecondary
                 font.pixelSize: Ui.textCaption
             }

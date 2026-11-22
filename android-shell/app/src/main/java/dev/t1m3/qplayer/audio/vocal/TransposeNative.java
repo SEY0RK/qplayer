@@ -94,8 +94,12 @@ public final class TransposeNative implements VocalSeparator {
         pcmChunk = alloc(CHUNK_SAMPLES * channels);
         intervalBytes = new byte[INTERVAL_SAMPLES * bytesPerFrame];
         dryChunk = new byte[CHUNK_SAMPLES * bytesPerFrame];
-        inputRing = new Ring(CHUNK_SAMPLES * bytesPerFrame * 8);
-        vocalRing = new byte[INTERVAL_SAMPLES * bytesPerFrame * 8];
+        // Generous rings: the producer runs in whole 24576-frame intervals while the
+        // consumer drains a few ms at a time, so a burst can fill several intervals.
+        // Both are now bounded (see Ring), so overflow drops the oldest audio instead
+        // of corrupting the read cursor.
+        inputRing = new Ring(CHUNK_SAMPLES * bytesPerFrame * 16);
+        vocalRing = new byte[INTERVAL_SAMPLES * bytesPerFrame * 32];
         vocalRead = vocalWrite = vocalAvail = 0;
         return true;
     }
@@ -249,31 +253,61 @@ public final class TransposeNative implements VocalSeparator {
         if (modelHandle != 0L) { VocalRemovalProcessor.releaseMdx(modelHandle); modelHandle = 0L; }
     }
 
-    /** Simple growable-free byte ring sized at construction. */
+    /**
+     * Bounded byte ring.
+     *
+     * <p>The previous version had NO capacity check: once full it kept advancing
+     * {@code write} past {@code read}, silently overwriting unread audio and
+     * inflating {@code size} beyond the array length. That surfaced as the stream
+     * jumping backwards / repeating a section. Writes now drop the OLDEST bytes
+     * when full, so the buffer can never alias itself.
+     */
     private static final class Ring {
         private final byte[] buf;
         private int read, write, size;
+        private long dropped;
+
         Ring(int cap) { buf = new byte[Math.max(1, cap)]; }
+
         int available() { return size; }
+        long droppedBytes() { return dropped; }
+
         void write(byte[] src, int off, int len) {
-            while (len > 0) {
-                int w = Math.min(len, buf.length - write);
-                System.arraycopy(src, off, buf, write, w);
-                write = (write + w) % buf.length;
-                off += w; len -= w; size += w;
+            final int cap = buf.length;
+            if (len > cap) {                 // keep only the newest window
+                off += len - cap;
+                len = cap;
+                read = write = size = 0;
             }
+            int needFree = len - (cap - size);
+            if (needFree > 0) {              // make room by discarding the oldest
+                read = (read + needFree) % cap;
+                size -= needFree;
+                dropped += needFree;
+            }
+            int contiguous = Math.min(len, cap - write);
+            System.arraycopy(src, off, buf, write, contiguous);
+            if (contiguous < len) {
+                System.arraycopy(src, off + contiguous, buf, 0, len - contiguous);
+            }
+            write = (write + len) % cap;
+            size += len;
         }
+
         byte[] peek(int n) {
             byte[] out = new byte[n];
-            int r = read;
-            for (int k = 0; k < n; k++) { out[k] = buf[r]; r = (r + 1) % buf.length; }
+            int first = Math.min(n, buf.length - read);
+            System.arraycopy(buf, read, out, 0, first);
+            if (first < n) System.arraycopy(buf, 0, out, first, n - first);
             return out;
         }
+
         void discard(int n) {
             n = Math.min(n, size);
             read = (read + n) % buf.length;
             size -= n;
         }
+
         void clear() { read = write = size = 0; }
     }
 }
