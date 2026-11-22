@@ -106,9 +106,10 @@ SmoothRectangle {
     }
 
     VolumePopup { id: volumePopup }
-    onWidthChanged: volumePopup.close()
-    onYChanged: volumePopup.close()
-    function handleBack() { return volumePopup.handleBack() }
+    VocalMixPopup { id: vocalPopup }
+    onWidthChanged: { volumePopup.close(); vocalPopup.close() }
+    onYChanged: { volumePopup.close(); vocalPopup.close() }
+    function handleBack() { return volumePopup.handleBack() || vocalPopup.handleBack() }
 
     // ---- Cover ----------------------------------------------------------------
     CoverImage {
@@ -174,16 +175,27 @@ SmoothRectangle {
         // Mobile keeps like at compact-phone widths. Desktop reserves the volume
         // control, so the optional like yields sooner as the window narrows.
         readonly property bool showLike: mini.width >= (mini.desktopVolumeControl ? 380 : 280)
-        width: (mini.desktopVolumeControl ? 40 : 0) + (showLike ? 40 : 0) + 44 + 40 + 8
+        readonly property bool showVocal: player.vocalSupported
+        width: (showVocal ? 40 : 0) + (mini.desktopVolumeControl ? 40 : 0) + (showLike ? 40 : 0) + 44 + 40 + 8
         height: 44
         x: mini.width - width - 6
         y: (mini.height - height) / 2
 
         IconButton {
+            id: compactVocal
+            visible: compactCluster.showVocal
+            x: 0
+            y: 2
+            type: "standard"
+            icon: "graphic_eq"
+            contentColor: player.vocalMix !== 50 ? Ui.accent : Theme.color.onSurfaceVariantColor
+            onClicked: vocalPopup.open(compactVocal)
+        }
+        IconButton {
             objectName: "miniPlayerVolumeButton"
             id: compactVolume
             visible: mini.desktopVolumeControl
-            x: 0
+            x: compactCluster.showVocal ? 40 : 0
             y: 2
             type: "standard"
             icon: settings.appVolume === 0 ? "volume_off"
@@ -193,7 +205,7 @@ SmoothRectangle {
         IconButton {
             id: compactLike
             visible: compactCluster.showLike
-            x: mini.desktopVolumeControl ? 40 : 0
+            x: (compactCluster.showVocal ? 40 : 0) + (mini.desktopVolumeControl ? 40 : 0)
             y: 2
             type: "standard"
             enabled: player.currentLikeable
@@ -331,6 +343,18 @@ SmoothRectangle {
             width: wideCluster.width
             height: 16
         }
+    }
+
+    IconButton {
+        id: wideVocal
+        objectName: "miniPlayerWideVocalButton"
+        visible: mini.wideLayout && player.vocalSupported
+        x: mini.width - width - (mini.desktopVolumeControl ? 56 : 12)
+        y: (mini.height - height) / 2
+        type: "standard"
+        icon: "graphic_eq"
+        contentColor: player.vocalMix !== 50 ? Ui.accent : Theme.color.onSurfaceVariantColor
+        onClicked: vocalPopup.open(wideVocal)
     }
 
     IconButton {

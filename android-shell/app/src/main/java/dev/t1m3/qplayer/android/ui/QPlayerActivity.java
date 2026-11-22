@@ -5,7 +5,7 @@ import dev.t1m3.qplayer.android.graphics.AndroidColorExtractor;
 import dev.t1m3.qplayer.i18n.I18n;
 import dev.t1m3.qplayer.android.library.AndroidLibraryScanner;
 import dev.t1m3.qplayer.android.library.AndroidMetadataReader;
-import dev.t1m3.qplayer.android.playback.AndroidAudioBackend;
+import dev.t1m3.qplayer.android.playback.ExoAudioBackend;
 import dev.t1m3.qplayer.android.playback.OverlayLyricWindow;
 import dev.t1m3.qplayer.android.playback.PlaybackService;
 import dev.t1m3.qplayer.android.settings.PrefsSettingsStore;
@@ -185,7 +185,7 @@ public final class QPlayerActivity extends Activity {
                     } catch (PackageManager.NameNotFoundException ignored) {
                     }
                     initializeLyricFonts(app);
-                    return new PlayerController(new AndroidAudioBackend(app), new AndroidMetadataReader(app));
+                    return new PlayerController(new ExoAudioBackend(app), new AndroidMetadataReader(app));
                 }, ENGINE_IO);
         initializing = initialization;
         initialization.thenApplyAsync(c -> {

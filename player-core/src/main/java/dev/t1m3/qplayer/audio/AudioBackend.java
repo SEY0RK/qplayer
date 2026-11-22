@@ -88,4 +88,19 @@ public interface AudioBackend {
 
     /** The background download finished and {@code completePath} is a full file. */
     default void notifyCacheComplete() { }
+
+    // ---- Optional vocal separation (ExoPlayer backend only) ---------------
+
+    /** True when this backend can run real-time vocal separation. */
+    default boolean supportsVocalMix() { return false; }
+
+    /** Slider 0..100 (50 = original). No-op on backends without support. */
+    default void setVocalMix(int percent) { }
+
+    /** 0=DISABLED 1=WARMUP 2=READY 3=PROCESSING 4=DEGRADED 5=RELEASED. */
+    default int vocalState() { return -1; }
+
+    default boolean vocalReady() { return false; }
+    default long vocalProcessedFrames() { return 0L; }
+    default long vocalFallbackFrames() { return 0L; }
 }

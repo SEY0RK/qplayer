@@ -488,6 +488,12 @@ public final class PlayerController {
      *  unrelated rows in any other list. */
     public final Property<String> currentMediaId = new Property<>("");
     public final Property<Float> volume = new Property<>(0.8f);
+    /** Vocal/instrumental mixer slider, 0..100 (50 = original PCM passthrough). */
+    public final Property<Integer> vocalMix = new Property<>(50);
+    /** Whether the active backend supports real-time vocal separation. */
+    public final Property<Boolean> vocalSupported = new Property<>(false);
+    /** 0=disabled 1=warmup 2=ready 3=processing 4=degraded -1=unsupported. */
+    public final Property<Integer> vocalState = new Property<>(-1);
     /** Zero disables the session-only sleep timer. Rounded up for its UI label. */
     public final Property<Integer> sleepTimerRemainingMinutes = new Property<>(0);
     public final Property<Boolean> currentLiked = new Property<>(false);
@@ -1004,6 +1010,8 @@ public final class PlayerController {
                     });
             credentialOwnerOnlyFallback.set(pluginHostApi.usesOwnerOnlyCredentialProtection());
             backend.setVolume(volume.peek());
+            // Vocal separation is backend-dependent (ExoPlayer only).
+            vocalSupported.set(backend.supportsVocalMix());
 
             // Re-baseline the media session's position once audio actually starts (the
             // backend prepares asynchronously, so the position at play() time is stale).
@@ -6719,6 +6727,22 @@ public final class PlayerController {
             applyEffectiveVolume(currentFadeGain());
             volume.set(clamped);
         }
+    }
+
+    /** Vocal mix slider 0..100; 50 = strict original-PCM passthrough. */
+    public void setVocalMix(int percent) {
+        synchronized (QmlRuntimeLock.MONITOR) {
+            int clamped = Math.max(0, Math.min(100, percent));
+            backend.setVocalMix(clamped);
+            vocalMix.set(clamped);
+            vocalState.set(backend.vocalState());
+        }
+    }
+
+    /** Refresh vocal status (called periodically by the UI while the popup is open). */
+    public void refreshVocalState() {
+        if (!vocalSupported.peek()) return;
+        vocalState.set(backend.vocalState());
     }
 
     public void setPlayLevel(String level) {
