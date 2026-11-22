@@ -109,11 +109,17 @@ public final class ExoAudioBackend implements AudioBackend {
         }
     };
 
-    /** Decoder target that will make the delayed output land on {@code contentMs}. */
+    /**
+     * Decoder target for a seek.
+     *
+     * <p>Deliberately does NOT add the processing delay. The delay window is filled
+     * with silence (reported as buffering), and the first content emitted afterwards
+     * is exactly {@code contentMs}. Seeking to {@code contentMs + delay} — which an
+     * earlier build did — skipped that whole span of audio entirely.
+     */
     private long decoderTargetFor(long contentMs) {
-        long delay = vocalProcessor.activeDelayMs();
-        long target = contentMs + delay;
         ExoPlayer p = player;
+        long target = Math.max(0L, contentMs);
         if (p != null) {
             long dur = p.getDuration();
             if (dur > 0 && target > dur - 200) target = Math.max(0L, dur - 200);
@@ -295,7 +301,10 @@ public final class ExoAudioBackend implements AudioBackend {
         runOnMain(() -> {
             pendingSeekMs = target;
             cPositionMs = target;
-            engageFloorMs = -1;   // new base after a seek; recomputed when needed
+            // Hold the reported position at the seek target while the delay window
+            // refills, so the bar reads as "buffering" instead of crawling forward
+            // over silence.
+            engageFloorMs = target;
             if (player != null && prepared) player.seekTo(decoderTargetFor(target));
         });
     }
