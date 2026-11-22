@@ -77,7 +77,7 @@ public final class OfflineVocalSeparator {
         long stft = 0L, model = 0L;
         FileOutputStream out = null;
         try {
-            stft = VocalRemovalProcessor.initStft(SAMPLE_RATE, N_FFT, HOP, DIM_F, CHANNELS);
+            stft = VocalRemovalProcessor.initStft(SAMPLE_RATE, N_FFT, HOP, DIM_F);
             model = VocalRemovalProcessor.initMdxModel(modelPath, 4, DIM_F, MODEL_CHANNELS);
             if (stft == 0L || model == 0L) {
                 Log.w(TAG, "native init failed stft=" + stft + " model=" + model);
