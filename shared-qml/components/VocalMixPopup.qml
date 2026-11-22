@@ -2,9 +2,12 @@ import QtQuick
 import miuix.Core
 import design
 
-// Vocal/instrumental mixer popup, modelled after VolumePopup: a button opens it,
-// it floats above the MiniPlayer/lyric page, and a slider writes player.vocalMix.
-// 0 = instrumental, 50 = original PCM passthrough, 100 = vocals only.
+// Vocal separation popup, modelled after VolumePopup.
+//
+// A master SWITCH decides whether separation runs at all: off = untouched
+// original PCM. When on, the slider spans instrumental -> vocals. Centre happens
+// to reproduce the original mix, but it is NOT a required detent any more —
+// expecting a finger to land exactly on 50% was the wrong interaction.
 Item {
     id: control
     width: 0
@@ -49,15 +52,24 @@ Item {
         return true
     }
 
+    function stateLabel() {
+        if (!player.vocalSupported) return "不支持"
+        if (!player.vocalOn) return "已关闭"
+        var s = player.vocalState
+        if (s === 3) return "分离中"
+        if (s === 1) return "准备中"
+        if (s === 4) return "已降级"
+        return "就绪"
+    }
+
     Item {
         id: overlayLayer
         visible: false
         z: 99999
         Keys.onEscapePressed: { control.handleBack(); event.accepted = true }
 
-        // Separation state changes on the AUDIO thread a block after the slider
-        // moves, so a single read at open time would latch a stale value (the popup
-        // kept saying "separating" even back at centre). Poll while visible.
+        // Separation state changes on the AUDIO thread a block after the switch or
+        // slider moves, so poll while visible instead of latching a stale value.
         Timer {
             id: statePoll
             interval: 300
@@ -71,8 +83,8 @@ Item {
         Rectangle {
             id: popupContainer
             objectName: "vocalMixPopup"
-            width: Math.max(0, Math.min(320, overlayLayer.width - 32))
-            height: 132
+            width: Math.max(0, Math.min(340, overlayLayer.width - 32))
+            height: 184
             x: Math.max(16, Math.min(control.targetX - width / 2, overlayLayer.width - width - 16))
             y: Math.max(16, Math.min(control.targetY - height - 12, overlayLayer.height - height - 16))
             radius: Ui.radiusLg
@@ -102,7 +114,7 @@ Item {
                 anchors.topMargin: Ui.space3
                 anchors.left: parent.left
                 anchors.leftMargin: Ui.space4
-                text: "人声 / 伴奏"
+                text: "人声分离"
                 color: Ui.textPrimary
                 font.pixelSize: Ui.textBody
                 font.weight: Ui.weightBold
@@ -110,15 +122,25 @@ Item {
 
             Text {
                 id: statusText
-                anchors.top: titleText.top
-                anchors.right: parent.right
-                anchors.rightMargin: Ui.space4
-                text: !player.vocalSupported ? "不支持"
-                      : (player.vocalState === 3 ? "分离中"
-                      : (player.vocalState === 1 ? "准备中"
-                      : (player.vocalState === 4 ? "已降级" : "原声")))
+                anchors.verticalCenter: titleText.verticalCenter
+                anchors.left: titleText.right
+                anchors.leftMargin: Ui.space2
+                text: control.stateLabel()
                 color: player.vocalState === 4 ? Ui.danger : Ui.textSecondary
                 font.pixelSize: Ui.textCaption
+            }
+
+            Switch {
+                id: enableSwitch
+                objectName: "vocalEnableSwitch"
+                anchors.verticalCenter: titleText.verticalCenter
+                anchors.right: parent.right
+                anchors.rightMargin: Ui.space4
+                enabled: player.vocalSupported
+                checked: player.vocalOn
+                onCheckedChanged: {
+                    if (checked !== player.vocalOn) player.setVocalOn(checked)
+                }
             }
 
             Slider {
@@ -129,12 +151,15 @@ Item {
                 anchors.right: parent.right
                 anchors.rightMargin: Ui.space4
                 anchors.top: titleText.bottom
-                anchors.topMargin: Ui.space3
+                anchors.topMargin: Ui.space4
                 from: 0
                 to: 100
                 stepSize: 1
+                enabled: player.vocalOn
+                opacity: enabled ? 1.0 : 0.4
                 value: player.vocalMix
-                onValueChanged: player.setVocalMix(Math.round(value))
+                onMoved: player.setVocalMix(Math.round(value))
+                onEditingFinished: player.setVocalMix(Math.round(value))
             }
 
             Row {
@@ -144,9 +169,34 @@ Item {
                 anchors.leftMargin: Ui.space4
                 anchors.right: parent.right
                 anchors.rightMargin: Ui.space4
-                Text { width: parent.width / 3; text: "伴奏"; color: Ui.textTertiary; font.pixelSize: Ui.textCaption }
-                Text { width: parent.width / 3; text: "原声"; color: Ui.textTertiary; font.pixelSize: Ui.textCaption; horizontalAlignment: Text.AlignHCenter }
-                Text { width: parent.width / 3; text: "人声"; color: Ui.textTertiary; font.pixelSize: Ui.textCaption; horizontalAlignment: Text.AlignRight }
+                Text {
+                    width: parent.width / 2
+                    text: "伴奏"
+                    color: Ui.textTertiary
+                    font.pixelSize: Ui.textCaption
+                }
+                Text {
+                    width: parent.width / 2
+                    text: "人声"
+                    color: Ui.textTertiary
+                    font.pixelSize: Ui.textCaption
+                    horizontalAlignment: Text.AlignRight
+                }
+            }
+
+            Text {
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: Ui.space3
+                anchors.left: parent.left
+                anchors.leftMargin: Ui.space4
+                anchors.right: parent.right
+                anchors.rightMargin: Ui.space4
+                text: player.vocalOn
+                      ? "拖动调节伴奏与人声比例；开启或跳转后约 1.5 秒生效"
+                      : "打开开关后按比例分离；关闭时输出原声"
+                color: Ui.textTertiary
+                font.pixelSize: Ui.textCaption
+                wrapMode: Text.WordWrap
             }
         }
     }

@@ -124,33 +124,16 @@ public final class VocalMixingProcessor {
         if (frames <= 0) return;
         int n = frames * channels;
 
+        // Separation is governed by an explicit on/off switch now, not by the slider
+        // landing exactly on centre — asking a finger to hit 50% was unreasonable.
+        // With the switch on, the slider spans instrumental <-> vocals and the
+        // midpoint simply happens to reproduce the original mix.
         boolean bypass = !enabled
-                || VocalMixMath.isPassthrough(slider)
                 || state == VocalProcessorState.DEGRADED
                 || state == VocalProcessorState.RELEASED
                 || !separator.isSupported();
 
         if (bypass) {
-            // True raw-PCM passthrough: nothing writes pcm[] here.
-            boolean passthrough = VocalMixMath.isPassthrough(slider);
-            if (passthrough && enabled && separator.isReady()
-                    && separator.mixesInternally()) {
-                // Shadow-run the separator at centre: its output equals the original
-                // mix, so we discard it, but the 0.7 s window stays primed and
-                // dragging straight back out takes effect immediately instead of
-                // re-priming (which sounded like the track restarting).
-                if (vocalScratch.length < n) vocalScratch = new short[n];
-                try {
-                    separator.separate(pcm, 0, vocalScratch, 0, frames, channels);
-                    state = VocalProcessorState.READY;
-                } catch (Throwable t) {
-                    state = VocalProcessorState.DEGRADED;
-                }
-            } else if (!enabled || passthrough) {
-                // Reflect the real reason so the UI stops reporting "separating"
-                // once the slider is back at centre or separation was switched off.
-                state = VocalProcessorState.DISABLED;
-            }
             fallbackFrames.addAndGet(frames);
             return;
         }

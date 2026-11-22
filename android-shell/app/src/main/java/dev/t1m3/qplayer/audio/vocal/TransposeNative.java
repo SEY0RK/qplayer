@@ -35,6 +35,10 @@ public final class TransposeNative implements VocalSeparator {
     private volatile boolean inferenceFailed;
     /** Slider in [0,1]; read once per block when blending inside native. */
     private volatile float slider = 0.5f;
+    /** Dry frames handed to the caller while the window filled (consumed as skip). */
+    private int primedFrames;
+    /** True once the first separated interval has been produced. */
+    private boolean everProduced;
     private int diagCount;
 
     private final String modelPath;
@@ -125,10 +129,21 @@ public final class TransposeNative implements VocalSeparator {
                 + " vocalAvail=" + vocalAvail + " inputAvail=" + inputRing.available()
                 + " stft=" + stftHandle + " model=" + modelHandle);
         if (vocalAvail < wantBytes) {
-            // pending only when inference itself is healthy; a real failure must
-            // surface as DEGRADED so the UI/telemetry are honest.
-            pending = !inferenceFailed;
-            return false;
+            if (!everProduced) {
+                // Window still filling: let the caller emit live dry PCM so playback
+                // stays audible. Count these frames so the first separated output can
+                // skip exactly the audio the listener has already heard.
+                primedFrames += frames;
+                pending = !inferenceFailed;
+                return false;
+            }
+            // Catch-up phase: separated audio exists but all of it describes frames
+            // already played as dry. Emitting it would repeat the track, and emitting
+            // dry again would push the misalignment further out (both advance at the
+            // same rate, so it would never converge). Silence for this short window
+            // is the only artefact-free option.
+            java.util.Arrays.fill(vocals, vocOff, vocOff + need, (short) 0);
+            return true;
         }
         pending = false;
         byte[] out = readBytes(wantBytes);
@@ -148,7 +163,22 @@ public final class TransposeNative implements VocalSeparator {
             System.arraycopy(pcm, 0, dryChunk, 0, chunkBytes);
             if (!processChunk()) return;
             inputRing.discard(INTERVAL_SAMPLES * bytesPerFrame);
-            writeVocal(intervalBytes);
+            // Set here (not in separate): while the catch-up skip is still running
+            // the caller keeps getting silence, and those frames must NOT count as
+            // primed or the debt would grow as fast as it is repaid.
+            everProduced = true;
+
+            // Drop the part of this interval that was already played as dry PCM.
+            // primedFrames is the exact number of dry frames handed to the caller
+            // while the window filled, so subtracting it makes separation start
+            // precisely at the current play position.
+            int skipFrames = Math.min(primedFrames, INTERVAL_SAMPLES);
+            primedFrames -= skipFrames;
+            int skipBytes = skipFrames * bytesPerFrame;
+            int keep = intervalBytes.length - skipBytes;
+            logDiag("emit skip=" + skipFrames + " keep=" + keep
+                    + " primedLeft=" + primedFrames);
+            if (keep > 0) writeVocal(intervalBytes, skipBytes, keep);
         }
     }
 
@@ -222,13 +252,16 @@ public final class TransposeNative implements VocalSeparator {
         return b;
     }
 
-    private void writeVocal(byte[] b) {
-        if (vocalRing.length - vocalAvail < b.length) return;
-        int tail = Math.min(b.length, vocalRing.length - vocalWrite);
-        System.arraycopy(b, 0, vocalRing, vocalWrite, tail);
-        System.arraycopy(b, tail, vocalRing, 0, b.length - tail);
-        vocalWrite = (vocalWrite + b.length) % vocalRing.length;
-        vocalAvail += b.length;
+    private void writeVocal(byte[] b) { writeVocal(b, 0, b.length); }
+
+    private void writeVocal(byte[] b, int off, int len) {
+        if (len <= 0) return;
+        if (vocalRing.length - vocalAvail < len) return;
+        int tail = Math.min(len, vocalRing.length - vocalWrite);
+        System.arraycopy(b, off, vocalRing, vocalWrite, tail);
+        if (tail < len) System.arraycopy(b, off + tail, vocalRing, 0, len - tail);
+        vocalWrite = (vocalWrite + len) % vocalRing.length;
+        vocalAvail += len;
     }
 
     private byte[] readBytes(int n) {
@@ -242,10 +275,15 @@ public final class TransposeNative implements VocalSeparator {
     }
 
     @Override public void flush() {
+        logDiag("FLUSH in.avail=" + (inputRing == null ? 0 : inputRing.available())
+                + " vocalAvail=" + vocalAvail + " primed=" + primedFrames);
+        diagCount = 0;   // re-arm so post-seek behaviour is visible in logcat
         if (inputRing != null) inputRing.clear();
         vocalRead = vocalWrite = vocalAvail = 0;
         inferenceFailed = false;
         pending = false;
+        primedFrames = 0;
+        everProduced = false;
     }
 
     @Override public void close() {

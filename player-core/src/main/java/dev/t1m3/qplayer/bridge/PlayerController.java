@@ -488,8 +488,10 @@ public final class PlayerController {
      *  unrelated rows in any other list. */
     public final Property<String> currentMediaId = new Property<>("");
     public final Property<Float> volume = new Property<>(0.8f);
-    /** Vocal/instrumental mixer slider, 0..100 (50 = original PCM passthrough). */
-    public final Property<Integer> vocalMix = new Property<>(50);
+    /** Vocal separation master switch; when off the original PCM is emitted. */
+    public final Property<Boolean> vocalOn = new Property<>(false);
+    /** Blend 0..100: 0 = instrumental, 100 = vocals (midpoint = original mix). */
+    public final Property<Integer> vocalMix = new Property<>(0);
     /** Whether the active backend supports real-time vocal separation. */
     public final Property<Boolean> vocalSupported = new Property<>(false);
     /** 0=disabled 1=warmup 2=ready 3=processing 4=degraded -1=unsupported. */
@@ -6729,13 +6731,21 @@ public final class PlayerController {
         }
     }
 
-    /** Vocal mix slider 0..100; 50 = strict original-PCM passthrough. */
+    /** Vocal separation on/off. Off = untouched original PCM. */
+    public void setVocalOn(boolean on) {
+        synchronized (QmlRuntimeLock.MONITOR) {
+            backend.setVocalOn(on);
+            vocalOn.set(on);
+            vocalState.set(backend.vocalState());
+        }
+    }
+
+    /** Blend 0..100: 0 = instrumental, 100 = vocals (midpoint = original). */
     public void setVocalMix(int percent) {
         synchronized (QmlRuntimeLock.MONITOR) {
             int clamped = Math.max(0, Math.min(100, percent));
             backend.setVocalMix(clamped);
             vocalMix.set(clamped);
-            vocalState.set(backend.vocalState());
         }
     }
 
