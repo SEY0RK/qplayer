@@ -20,15 +20,19 @@ android {
         versionCode = 114
         versionName = "2.1.1"
         manifestPlaceholders["appLabel"] = "QPlayer"
+        externalNativeBuild {
+            cmake {
+                abiFilters += listOf("arm64-v8a")
+                arguments += listOf("-DANDROID_PLATFORM=android-26", "-DANDROID_STL=c++_static")
+                cppFlags += listOf("-O3", "-fsigned-char")
+            }
+        }
     }
 
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
-            abiFilters += listOf("arm64-v8a")
-            arguments += listOf("-DANDROID_PLATFORM=android-26", "-DANDROID_STL=c++_static")
-            cppFlags += listOf("-O3", "-fsigned-char")
         }
     }
 
