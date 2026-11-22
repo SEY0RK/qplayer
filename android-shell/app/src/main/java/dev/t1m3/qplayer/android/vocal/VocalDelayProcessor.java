@@ -60,8 +60,8 @@ public final class VocalDelayProcessor implements AudioProcessor {
     private long inputCursor;
 
     private boolean primed;
-    private boolean usingSep;
-    private int xfadeRemaining;
+    /** 0 = emitting dry, 1 = emitting separated; ramps over XFADE_FRAMES. */
+    private float sepBlend;
 
     // ---- diagnostics ------------------------------------------------------
     private long starvedBlocks;
@@ -84,14 +84,11 @@ public final class VocalDelayProcessor implements AudioProcessor {
     public void setEnabled(boolean on) {
         if (this.enabled == on) return;
         this.enabled = on;
-        if (!on) {
-            // Keep the queue: re-enabling should resume at the current cursor rather
-            // than re-priming. Using cursor-matched dry is what makes the toggle
-            // seamless in both directions.
-            usingSep = false;
-            xfadeRemaining = XFADE_FRAMES;
-        }
-        Log.i(TAG, "enabled=" + on + " at outputCursor=" + outputCursor);
+        // No buffer flush either way. Dry history is kept, the separated queue is
+        // kept, and the blend simply ramps to the other side at the CURRENT cursor
+        // — which is what makes the toggle seamless in both directions.
+        Log.i(TAG, "enabled=" + on + " at outputCursor=" + outputCursor
+                + " blend=" + sepBlend);
     }
 
     public void setSlider(float p) {
@@ -224,58 +221,78 @@ public final class VocalDelayProcessor implements AudioProcessor {
         }
     }
 
+    /**
+     * Emit one block by walking it in SEGMENT SLICES.
+     *
+     * <p>A separated block is 24576 frames while an output block is ~1152, so their
+     * boundaries rarely line up. Requiring a single block to cover the whole output
+     * window (the previous approach) failed on every boundary crossing and dropped
+     * back to dry PCM — audibly leaking the OTHER stem in bursts ("在伴奏档听到人声").
+     * Here each frame takes its own segment and the blend factor ramps smoothly.
+     */
     private void emitFrames(ByteBuffer out, int frames, int ch) {
         int samples = frames * ch;
         if (mixScratch.length < samples) mixScratch = new short[samples];
 
-        // Read the dry block at the OUTPUT cursor, not the newest input.
+        // Dry PCM at the OUTPUT cursor is the base and the fallback.
         readDry(mixScratch, samples);
 
-        StreamingSeparator.Segment cover = findCovering(outputCursor, frames);
-        boolean wantSep = enabled && cover != null;
+        StreamingSeparator eng = engine;
+        boolean sepPossible = enabled && eng != null && eng.isReady();
 
-        if (wantSep != usingSep) {
-            // Short cross-fade either way; never a hard cut.
-            usingSep = wantSep;
-            xfadeRemaining = XFADE_FRAMES;
+        float s = slider;
+        float dg = s <= 0.5f ? 1f : 2f * (1f - s);
+        float vg = 2f * s - 1f;
+        float step = 1f / XFADE_FRAMES;
+
+        StreamingSeparator.Segment cur = null;
+        int starvedFrames = 0;
+        long starvedAt = -1;
+
+        for (int f = 0; f < frames; f++) {
+            long pos = outputCursor + f;
+            if (cur == null || pos < cur.startFrame || pos >= cur.endFrame()) {
+                cur = findSegmentAt(pos);
+            }
+            boolean haveSep = sepPossible && cur != null;
+            if (sepPossible && !haveSep) {
+                if (starvedAt < 0) starvedAt = pos;
+                starvedFrames++;
+            }
+
+            float target = haveSep ? 1f : 0f;
+            if (sepBlend < target) sepBlend = Math.min(target, sepBlend + step);
+            else if (sepBlend > target) sepBlend = Math.max(target, sepBlend - step);
+
+            // Starved: no separated data covers this frame, so emit dry and let the
+            // blend decay on its own. Substituting dry for `voc` would NOT work —
+            // dg+vg equals 2s below centre, which fades the audio out entirely.
+            if (sepBlend <= 0f || !haveSep) continue;
+
+            int base = f * ch;
+            int segOff = (int) (pos - cur.startFrame) * ch;
+            for (int c = 0; c < ch; c++) {
+                short dry = mixScratch[base + c];
+                int so = segOff + c;
+                short voc = so >= 0 && so < cur.pcm.length ? cur.pcm[so] : dry;
+                float mixed = dry * dg + voc * vg;
+                float blended = dry + (mixed - dry) * sepBlend;
+                int v = (int) blended;
+                if (v > Short.MAX_VALUE) v = Short.MAX_VALUE;
+                if (v < Short.MIN_VALUE) v = Short.MIN_VALUE;
+                mixScratch[base + c] = (short) v;
+            }
         }
-        if (enabled && cover == null && primed && engine != null && engine.isReady()) {
+
+        if (sepPossible && starvedFrames > 0) {
             starvedBlocks++;
-            if (starvedBlocks <= 20) {
+            if (starvedBlocks <= 30) {
                 long first = queue.isEmpty() ? -1 : queue.peekFirst().startFrame;
-                Log.w(TAG, "STARVED at out=" + outputCursor + " frames=" + frames
+                Log.w(TAG, "STARVED out=" + outputCursor + " starvedFrames=" + starvedFrames
+                        + "/" + frames + " firstAt=" + starvedAt
                         + " queue=" + queue.size() + " firstSeg=" + first
                         + " in=" + inputCursor + " lead=" + (inputCursor - outputCursor));
             }
-        }
-
-        if (usingSep && cover != null) {
-            float s = slider;
-            float dg = s <= 0.5f ? 1f : 2f * (1f - s);
-            float vg = 2f * s - 1f;
-            int segOff = (int) (outputCursor - cover.startFrame) * ch;
-            for (int f = 0; f < frames; f++) {
-                int base = f * ch;
-                float w = 1f;
-                if (xfadeRemaining > 0) {
-                    w = 1f - (float) xfadeRemaining / (float) XFADE_FRAMES;
-                    xfadeRemaining--;
-                }
-                for (int c = 0; c < ch; c++) {
-                    short dry = mixScratch[base + c];
-                    int so = segOff + f * ch + c;
-                    short voc = so >= 0 && so < cover.pcm.length ? cover.pcm[so] : dry;
-                    float mixed = dry * dg + voc * vg;
-                    float blended = dry + (mixed - dry) * w;
-                    int v = (int) blended;
-                    if (v > Short.MAX_VALUE) v = Short.MAX_VALUE;
-                    if (v < Short.MIN_VALUE) v = Short.MIN_VALUE;
-                    mixScratch[base + c] = (short) v;
-                }
-            }
-        } else if (xfadeRemaining > 0) {
-            // Fading back to dry: keep the last separated block for the fade tail.
-            xfadeRemaining = 0;
         }
 
         for (int i = 0; i < samples; i++) {
@@ -284,11 +301,11 @@ public final class VocalDelayProcessor implements AudioProcessor {
         }
     }
 
-    private StreamingSeparator.Segment findCovering(long startFrame, int frames) {
-        long end = startFrame + frames;
+    /** First queued block whose range contains {@code pos}, or null. */
+    private StreamingSeparator.Segment findSegmentAt(long pos) {
         for (StreamingSeparator.Segment s : queue) {
-            if (s.startFrame <= startFrame && s.endFrame() >= end) return s;
-            if (s.startFrame > startFrame) break;
+            if (pos >= s.startFrame && pos < s.endFrame()) return s;
+            if (s.startFrame > pos) break;
         }
         return null;
     }
@@ -351,8 +368,7 @@ public final class VocalDelayProcessor implements AudioProcessor {
         outputCursor = 0;
         inputCursor = 0;
         primed = false;
-        usingSep = false;
-        xfadeRemaining = 0;
+        sepBlend = 0f;
         StreamingSeparator eng = engine;
         if (eng != null) eng.reset();
         Log.i(TAG, "FLUSH");
