@@ -38,6 +38,13 @@ public interface VocalSeparator extends AutoCloseable {
     boolean separate(short[] dry, int dryOff, short[] vocals, int vocOff,
                      int frames, int channels);
 
+    /**
+     * Prepare format-dependent state (e.g. STFT buffers) once the audio format is
+     * known. Default no-op for separators that do not need it. Implementations
+     * that own a native STFT should create it here.
+     */
+    default boolean configure(int sampleRate, int channels) { return true; }
+
     /** Drop buffered state on seek / track change. */
     void flush();
 

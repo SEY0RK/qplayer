@@ -87,6 +87,12 @@ public final class VocalMixingProcessor {
         // Intentionally no flush(), no prewarm(), no state change.
     }
 
+    /** Prepare the separator for a concrete PCM format. Called once by the host. */
+    public boolean configureSeparator(int sampleRate, int channels) {
+        setChannels(channels);
+        return separator.configure(sampleRate, channels);
+    }
+
     public void flush() {
         separator.flush();
         resetRamp();

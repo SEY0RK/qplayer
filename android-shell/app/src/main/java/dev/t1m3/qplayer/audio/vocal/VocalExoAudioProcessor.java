@@ -45,7 +45,9 @@ public final class VocalExoAudioProcessor implements AudioProcessor {
         scratch = new short[maxSamples];
         outDirect = ByteBuffer.allocateDirect(maxSamples * 2).order(ByteOrder.nativeOrder());
         if (!configuredSeparator) {
-            mixer.setChannels(in.channelCount);
+            // The native separator needs the sample rate/channels to build its STFT;
+            // without this isReady() stays false forever and everything falls back.
+            mixer.configureSeparator(in.sampleRate, in.channelCount);
             configuredSeparator = true;
         }
         return outputFormat;
