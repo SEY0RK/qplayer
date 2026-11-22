@@ -46,6 +46,7 @@ public final class VocalSpikeActivity extends Activity {
         setContentView(status);
 
         File model = new File(getFilesDir(), "vocal/vocal_separation_core.bin");
+        copyModelFromAssets(model);
         TransposeNative sep = new TransposeNative(model.getAbsolutePath());
         append("native library: " + (sep.isSupported() ? "OK" : "MISSING"));
         append("model file: " + (model.isFile() ? model.length() + " bytes" : "MISSING"));
@@ -79,7 +80,12 @@ public final class VocalSpikeActivity extends Activity {
 
         player = new ExoPlayer.Builder(this, rf).build();
         String src = getIntent().getStringExtra("src");
-        if (src == null || src.isEmpty()) src = "asset:///spike_test.wav";
+        if (src == null || src.isEmpty()) {
+            append("NO SOURCE. Launch with: adb shell am start -n "
+                    + getPackageName() + "/dev.t1m3.qplayer.android.spike.VocalSpikeActivity"
+                    + " --es src <file:// or https:// audio URI>");
+            return;
+        }
         append("source: " + src);
         player.setMediaItem(MediaItem.fromUri(src));
         player.prepare();
@@ -96,6 +102,24 @@ public final class VocalSpikeActivity extends Activity {
                 if (!isFinishing() && !isDestroyed()) status.postDelayed(this, 1000);
             }
         }, 1000);
+    }
+
+    /** CI packs the model into assets/; native needs a real filesystem path. */
+    private void copyModelFromAssets(File dst) {
+        try {
+            if (dst.isFile() && dst.length() > 29_000_000L) return; // already copied
+            File parent = dst.getParentFile();
+            if (parent != null) parent.mkdirs();
+            try (java.io.InputStream in = getAssets().open("vocal_separation_core.bin");
+                 java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
+                byte[] buf = new byte[1 << 16];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            }
+            append("model copied from assets: " + dst.length() + " bytes");
+        } catch (Throwable t) {
+            append("model copy FAILED: " + t);
+        }
     }
 
     private void append(String s) {
