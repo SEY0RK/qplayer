@@ -38,6 +38,10 @@ public final class VocalDelayProcessor implements AudioProcessor {
     private static final int XFADE_FRAMES = 882;      // 20 ms @ 44.1 kHz
     /** Queue depth guard: 16 blocks ≈ 8.8 s of headroom against short excursions. */
     private static final int MAX_QUEUE = 16;
+    /** Applied at the top of queueInput (audio thread) to avoid cross-thread ring edits. */
+    private volatile long pendingSkipTo = -1;
+    /** Maximum windows to run per audio block; keeps any single call well under a buffer. */
+    private static final int MAX_DRAIN_PER_BLOCK = 2;
 
     // ---- configuration ---------------------------------------------------
     private volatile int delayFrames = 66_150;        // 1.5 s @ 44.1 kHz, refined at runtime
@@ -75,7 +79,8 @@ public final class VocalDelayProcessor implements AudioProcessor {
     private final ArrayDeque<StreamingSeparator.Segment> queue = new ArrayDeque<>();
 
     // ---- cursors (frames, relative to the current seek base) -------------
-    private long outputCursor;
+    /** Written on the audio thread, read from the UI thread when re-aligning. */
+    private volatile long outputCursor;
     private long inputCursor;
 
     private boolean primed;
@@ -118,6 +123,16 @@ public final class VocalDelayProcessor implements AudioProcessor {
                 setDelayMs(DEFAULT_DELAY_MS);
                 startCalibration();
             }
+        } else if (on) {
+            // Re-enabling while the delay is already running. History piled up in the
+            // engine unconsumed, so ask it to jump to the window that covers the
+            // CURRENT output cursor. Without this the catch-up runs 4+ inferences on
+            // the audio thread (~1.4 s) — the stall users hear when toggling back on.
+            long needBase = outputCursor - StreamingSeparator.EXTRACT_OFFSET
+                    - StreamingSeparator.INTERVAL_FRAMES / 2;
+            if (needBase > 0) pendingSkipTo = needBase;
+            Log.i(TAG, "re-enable: align engine to out=" + outputCursor
+                    + " skipTo=" + Math.max(0, needBase));
         }
         // No buffer flush either way. Dry history is kept, the separated queue is
         // kept, and the blend simply ramps to the other side at the CURRENT cursor
@@ -341,6 +356,14 @@ public final class VocalDelayProcessor implements AudioProcessor {
         // 2. Feed the separator and harvest finished blocks.
         StreamingSeparator eng = engine;
         if (eng != null && eng.isReady()) {
+            // Re-align before feeding: while separation was off, history piled up
+            // unconsumed, and draining it all here would run several inferences on the
+            // audio thread (audible stall). Jumping the base means one window suffices.
+            long skip = pendingSkipTo;
+            if (skip >= 0) {
+                eng.skipTo(skip);
+                pendingSkipTo = -1;
+            }
             // Keep the ring current even while separation is OFF. On re-enable this
             // history is what lets the queue catch up to the output cursor at once
             // instead of re-priming for another full window — the difference between
@@ -351,12 +374,14 @@ public final class VocalDelayProcessor implements AudioProcessor {
                 // Calibration runs on its own thread/engine (startCalibration) so the
                 // audio path never blocks here.
                 //
-                // Drain UNCONDITIONALLY. Stopping the drain when the output queue
-                // looked full left blocks inside the engine, whose input ring then
-                // overran and dropped source frames — producing positional holes that
-                // guaranteed starvation. Bounding the output queue here instead is safe.
+                // Drain UNCONDITIONALLY, but cap the count: leaving blocks inside the
+                // engine overruns its input ring (positional holes), while draining
+                // unbounded can exceed the hardware buffer. Two windows ≈ 0.7 s worst
+                // case, and steady state only ever has one ready.
                 StreamingSeparator.Segment seg;
-                while ((seg = eng.poll()) != null) {
+                int drained = 0;
+                while (drained < MAX_DRAIN_PER_BLOCK && (seg = eng.poll()) != null) {
+                    drained++;
                     if (seg.endFrame() <= outputCursor) continue;   // already played past
                     while (queue.size() >= MAX_QUEUE) queue.pollFirst();
                     queue.addLast(seg);

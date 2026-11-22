@@ -264,6 +264,26 @@ public final class StreamingSeparator {
     }
     public long maxInferenceMs() { return maxInferenceNanos / 1_000_000; }
 
+    /**
+     * Drop buffered input older than {@code targetBaseFrame}.
+     *
+     * <p>While separation is switched off the ring keeps accumulating history but
+     * nothing consumes it, so on re-enable the engine would otherwise have to run
+     * several windows back-to-back (one inference each) to catch up — stalling the
+     * audio thread for over a second. Jumping the base forward makes the very next
+     * window cover the output cursor, so catching up costs exactly one inference.
+     */
+    public void skipTo(long targetBaseFrame) {
+        long delta = targetBaseFrame - inBaseFrame;
+        if (delta <= 0) return;
+        int frames = (int) Math.min(delta, inSize / channels);
+        int drop = frames * channels;
+        inRead = (inRead + drop) % inRing.length;
+        inSize -= drop;
+        inBaseFrame += frames;
+        Log.i(TAG, "skipTo " + targetBaseFrame + " (advanced " + frames + " frames)");
+    }
+
     public void reset() {
         inRead = inWrite = inSize = 0;
         inBaseFrame = 0;
