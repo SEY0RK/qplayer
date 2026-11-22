@@ -59,8 +59,6 @@ public final class VocalDelayProcessor implements AudioProcessor {
             StreamingSeparator.CHUNK_FRAMES * 1000 / StreamingSeparator.SAMPLE_RATE;
     /** Provisional delay used before this device has been measured. */
     private static final int DEFAULT_DELAY_MS = 1500;
-    private final long[] calibNanos = new long[CALIBRATION_RUNS];
-    private int calibDone;
     private volatile boolean calibrating;
     private volatile int presetDelayMs;
     private volatile java.util.function.IntConsumer onCalibrated;
@@ -114,14 +112,11 @@ public final class VocalDelayProcessor implements AudioProcessor {
                 Log.i(TAG, "using calibrated delay " + presetDelayMs + "ms");
             } else {
                 // Never measured. Start from the conservative default so the window
-                // can begin filling immediately, and measure in parallel; the result
-                // is persisted for the NEXT session because changing the delay
+                // can begin filling immediately, and measure in the background; the
+                // result is persisted for the NEXT session because changing the delay
                 // mid-playback would shift the output cursor.
                 setDelayMs(DEFAULT_DELAY_MS);
-                calibrating = true;
-                calibDone = 0;
-                Log.i(TAG, "calibration start (" + CALIBRATION_RUNS + " runs), "
-                        + "provisional delay " + DEFAULT_DELAY_MS + "ms");
+                startCalibration();
             }
         }
         // No buffer flush either way. Dry history is kept, the separated queue is
@@ -164,9 +159,49 @@ public final class VocalDelayProcessor implements AudioProcessor {
      * delay is what produces starvation, and starvation leaks the other stem — far
      * more audible than a slightly longer seek wait.
      */
-    private void applyCalibration() {
-        long maxNanos = 0;
-        for (int i = 0; i < calibDone; i++) maxNanos = Math.max(maxNanos, calibNanos[i]);
+    /**
+     * Measure inference cost on a PRIVATE engine, on a background thread.
+     *
+     * <p>Calibration originally ran inside {@code queueInput}, which blocked the audio
+     * thread for about a second and drained the hardware buffer — audible as a stutter
+     * followed by silence right when the switch was flipped. Inference cost does not
+     * depend on the audio CONTENT, so a silent chunk measures just as accurately as
+     * music, and a private engine leaves the playback engine's buffers uncontended.
+     */
+    private void startCalibration() {
+        if (calibrating) return;
+        calibrating = true;
+        Thread t = new Thread(() -> {
+            StreamingSeparator probe = null;
+            long maxNanos = 0;
+            try {
+                probe = new StreamingSeparator(modelPath, 2);
+                if (!probe.isReady()) {
+                    Log.w(TAG, "calibration probe not ready");
+                    calibrating = false;
+                    return;
+                }
+                short[] silence = new short[StreamingSeparator.CHUNK_FRAMES * 2];
+                probe.feed(silence, 0, StreamingSeparator.CHUNK_FRAMES);
+                for (int i = 0; i < CALIBRATION_RUNS; i++) {
+                    long dt = probe.calibrateOnce();
+                    if (dt > 0) maxNanos = Math.max(maxNanos, dt);
+                }
+                Log.i(TAG, "calibration probe max=" + (maxNanos / 1_000_000) + "ms");
+                applyCalibration(maxNanos);
+            } catch (Throwable e) {
+                Log.w(TAG, "calibration failed: " + e);
+                calibrating = false;
+            } finally {
+                if (probe != null) probe.close();
+            }
+        }, "qplayer-vocal-calib");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void applyCalibration(long maxNanos) {
+        if (maxNanos <= 0) { calibrating = false; return; }
         int inferMs = (int) (maxNanos / 1_000_000L);
         int margin = Math.max(150, inferMs / 6);
         int raw = ALGO_WINDOW_MS + inferMs + margin;
@@ -181,6 +216,12 @@ public final class VocalDelayProcessor implements AudioProcessor {
             setDelayMs(clamped);
             Log.i(TAG, "CALIBRATED inferMaxMs=" + inferMs + " -> " + clamped
                     + "ms raised now (was " + current + "ms)");
+        } else if (!primed) {
+            // Not emitting yet, so shrinking the window cannot move the output cursor —
+            // it only shortens how long the user waits. Take the win.
+            setDelayMs(clamped);
+            Log.i(TAG, "CALIBRATED inferMaxMs=" + inferMs + " -> " + clamped
+                    + "ms applied before priming (was " + current + "ms)");
         } else {
             Log.i(TAG, "CALIBRATED inferMaxMs=" + inferMs + " algoMs=" + ALGO_WINDOW_MS
                     + " raw=" + raw + " -> " + clamped + "ms (applies next session, current "
@@ -307,19 +348,10 @@ public final class VocalDelayProcessor implements AudioProcessor {
             eng.feed(work, 0, frames);
 
             if (enabled) {
-                // 2b. Size the delay on first use. One timed pass per block, measured
-                // on the window that is about to be consumed, so calibration costs no
-                // extra stream position. Output stays silent during this, which the UI
-                // reports as "preparing".
-                if (calibrating && calibDone < CALIBRATION_RUNS && eng.canCalibrate()) {
-                    long dt = eng.calibrateOnce();
-                    if (dt > 0) {
-                        calibNanos[calibDone++] = dt;
-                        if (calibDone >= CALIBRATION_RUNS) applyCalibration();
-                    }
-                }
-
-                // 2c. Drain UNCONDITIONALLY. Stopping the drain when the output queue
+                // Calibration runs on its own thread/engine (startCalibration) so the
+                // audio path never blocks here.
+                //
+                // Drain UNCONDITIONALLY. Stopping the drain when the output queue
                 // looked full left blocks inside the engine, whose input ring then
                 // overran and dropped source frames — producing positional holes that
                 // guaranteed starvation. Bounding the output queue here instead is safe.
