@@ -79,6 +79,7 @@ public final class StreamingSeparator {
     private long totalInferenceNanos;
     private long maxInferenceNanos;
     private long lastInferenceNanos;
+    private long overrunEvents;
 
     public StreamingSeparator(String modelPath, int channels) {
         this.channels = channels;
@@ -125,7 +126,13 @@ public final class StreamingSeparator {
             inRead = (inRead + drop) % cap;
             inSize -= drop;
             inBaseFrame += drop / channels;
-            Log.w(TAG, "input overrun, dropped " + (drop / channels) + " frames");
+            // Expected while separation is off (the ring keeps history but nothing
+            // consumes it), so keep the log quiet: first few, then every 200th.
+            overrunEvents++;
+            if (overrunEvents <= 3 || overrunEvents % 200 == 0) {
+                Log.w(TAG, "input overrun #" + overrunEvents + " dropped "
+                        + (drop / channels) + " frames");
+            }
         }
         int contiguous = Math.min(need, cap - inWrite);
         System.arraycopy(pcm, offset, inRing, inWrite, contiguous);

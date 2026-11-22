@@ -57,6 +57,8 @@ public final class VocalDelayProcessor implements AudioProcessor {
     /** Fixed part: the STFT window the separator needs before it can emit a block. */
     private static final int ALGO_WINDOW_MS =
             StreamingSeparator.CHUNK_FRAMES * 1000 / StreamingSeparator.SAMPLE_RATE;
+    /** Provisional delay used before this device has been measured. */
+    private static final int DEFAULT_DELAY_MS = 1500;
     private final long[] calibNanos = new long[CALIBRATION_RUNS];
     private int calibDone;
     private volatile boolean calibrating;
@@ -111,9 +113,15 @@ public final class VocalDelayProcessor implements AudioProcessor {
                 calibrating = false;
                 Log.i(TAG, "using calibrated delay " + presetDelayMs + "ms");
             } else {
+                // Never measured. Start from the conservative default so the window
+                // can begin filling immediately, and measure in parallel; the result
+                // is persisted for the NEXT session because changing the delay
+                // mid-playback would shift the output cursor.
+                setDelayMs(DEFAULT_DELAY_MS);
                 calibrating = true;
                 calibDone = 0;
-                Log.i(TAG, "calibration start (" + CALIBRATION_RUNS + " runs)");
+                Log.i(TAG, "calibration start (" + CALIBRATION_RUNS + " runs), "
+                        + "provisional delay " + DEFAULT_DELAY_MS + "ms");
             }
         }
         // No buffer flush either way. Dry history is kept, the separated queue is
@@ -123,8 +131,25 @@ public final class VocalDelayProcessor implements AudioProcessor {
                 + " blend=" + sepBlend + " engaged=" + engaged);
     }
 
-    /** Delay measured on this device by an earlier session; 0 = unmeasured. */
-    public void setPresetDelayMs(int ms) { presetDelayMs = Math.max(0, ms); }
+    /**
+     * Delay measured on this device by an earlier session; 0 = unmeasured.
+     *
+     * <p>When a measurement exists the delay is engaged from the FIRST FRAME of
+     * playback, not when the switch is flipped. That is what makes the toggle
+     * instantaneous: the output cursor is already running behind the decoder, so
+     * separated audio for the current position is available (or arrives within one
+     * window) and the cross-fade has something to fade to. Introducing the delay at
+     * toggle time would instead force a fresh buffer fill right when the user is
+     * listening for the effect.
+     */
+    public void setPresetDelayMs(int ms) {
+        presetDelayMs = Math.max(0, ms);
+        if (presetDelayMs > 0) {
+            engaged = true;
+            delayFrames = Math.max(4096, presetDelayMs * StreamingSeparator.SAMPLE_RATE / 1000);
+            Log.i(TAG, "delay engaged from playback start: " + presetDelayMs + "ms");
+        }
+    }
 
     /** Called once the delay has been measured, to persist it. */
     public void setOnCalibrated(java.util.function.IntConsumer cb) { onCalibrated = cb; }
@@ -148,9 +173,19 @@ public final class VocalDelayProcessor implements AudioProcessor {
         int stepped = ((raw + 249) / 250) * 250;
         int clamped = Math.max(1000, Math.min(4000, stepped));
         calibrating = false;
-        setDelayMs(clamped);
-        Log.i(TAG, "CALIBRATED inferMaxMs=" + inferMs + " algoMs=" + ALGO_WINDOW_MS
-                + " raw=" + raw + " -> " + clamped + "ms");
+        int current = delayMs();
+        if (clamped > current) {
+            // Under-provisioned: raise NOW. Too small a delay starves the queue and
+            // starves leak the other stem, which is far worse than a brief pause
+            // while the larger window fills.
+            setDelayMs(clamped);
+            Log.i(TAG, "CALIBRATED inferMaxMs=" + inferMs + " -> " + clamped
+                    + "ms raised now (was " + current + "ms)");
+        } else {
+            Log.i(TAG, "CALIBRATED inferMaxMs=" + inferMs + " algoMs=" + ALGO_WINDOW_MS
+                    + " raw=" + raw + " -> " + clamped + "ms (applies next session, current "
+                    + current + "ms)");
+        }
         java.util.function.IntConsumer cb = onCalibrated;
         if (cb != null) cb.accept(clamped);
     }
@@ -265,29 +300,35 @@ public final class VocalDelayProcessor implements AudioProcessor {
         // 2. Feed the separator and harvest finished blocks.
         StreamingSeparator eng = engine;
         if (eng != null && eng.isReady()) {
+            // Keep the ring current even while separation is OFF. On re-enable this
+            // history is what lets the queue catch up to the output cursor at once
+            // instead of re-priming for another full window — the difference between
+            // an instant toggle and a second of silence.
             eng.feed(work, 0, frames);
 
-            // 2b. Size the delay on first use. One timed pass per block, measured on
-            // the window that is about to be consumed, so calibration costs no extra
-            // stream position. Output stays silent during this, which the UI reports
-            // as "preparing".
-            if (calibrating && calibDone < CALIBRATION_RUNS && eng.canCalibrate()) {
-                long dt = eng.calibrateOnce();
-                if (dt > 0) {
-                    calibNanos[calibDone++] = dt;
-                    if (calibDone >= CALIBRATION_RUNS) applyCalibration();
+            if (enabled) {
+                // 2b. Size the delay on first use. One timed pass per block, measured
+                // on the window that is about to be consumed, so calibration costs no
+                // extra stream position. Output stays silent during this, which the UI
+                // reports as "preparing".
+                if (calibrating && calibDone < CALIBRATION_RUNS && eng.canCalibrate()) {
+                    long dt = eng.calibrateOnce();
+                    if (dt > 0) {
+                        calibNanos[calibDone++] = dt;
+                        if (calibDone >= CALIBRATION_RUNS) applyCalibration();
+                    }
                 }
-            }
 
-            // 2c. Drain UNCONDITIONALLY. Stopping the drain when the output queue
-            // looked full left blocks inside the engine, whose input ring then
-            // overran and dropped source frames — producing positional holes that
-            // guaranteed starvation. Bounding the output queue here instead is safe.
-            StreamingSeparator.Segment seg;
-            while ((seg = eng.poll()) != null) {
-                if (seg.endFrame() <= outputCursor) continue;      // already played past
-                while (queue.size() >= MAX_QUEUE) queue.pollFirst();
-                queue.addLast(seg);
+                // 2c. Drain UNCONDITIONALLY. Stopping the drain when the output queue
+                // looked full left blocks inside the engine, whose input ring then
+                // overran and dropped source frames — producing positional holes that
+                // guaranteed starvation. Bounding the output queue here instead is safe.
+                StreamingSeparator.Segment seg;
+                while ((seg = eng.poll()) != null) {
+                    if (seg.endFrame() <= outputCursor) continue;   // already played past
+                    while (queue.size() >= MAX_QUEUE) queue.pollFirst();
+                    queue.addLast(seg);
+                }
             }
         }
 
