@@ -21,8 +21,14 @@ REF = "main"
 RAW = "https://raw.githubusercontent.com/joh9911/Transpose/%s/" % REF
 ORT_VERSION = "1.21.0"
 ORT_ZIP = "onnxruntime-win-x64-%s.zip" % ORT_VERSION
-ORT_URL = ("https://github.com/microsoft/onnxruntime/releases/download/v%s/%s"
-           % (ORT_VERSION, ORT_ZIP))
+# GitHub's release asset path 404s for this repo from some networks; the npmmirror
+# binary mirror serves the identical artefact, so try upstream first and fall back.
+ORT_URLS = [
+    "https://github.com/microsoft/onnxruntime/releases/download/v%s/%s"
+    % (ORT_VERSION, ORT_ZIP),
+    "https://registry.npmmirror.com/-/binary/onnxruntime/v%s/%s"
+    % (ORT_VERSION, ORT_ZIP),
+]
 
 NATIVE = "desktop-host/native"
 
@@ -62,8 +68,18 @@ def main():
         print("ORT already unpacked, skipping:", ort_dir)
     else:
         tmp_zip = NATIVE + "/" + ORT_ZIP
-        print("fetch", ORT_URL)
-        fetch(ORT_URL, tmp_zip, 20_000_000)
+        last = None
+        for url in ORT_URLS:
+            try:
+                print("fetch", url)
+                fetch(url, tmp_zip, 20_000_000)
+                last = None
+                break
+            except Exception as e:
+                print("  failed:", e)
+                last = e
+        if last is not None:
+            raise RuntimeError("all ONNX Runtime mirrors failed: %s" % last)
         with zipfile.ZipFile(tmp_zip) as z:
             z.extractall(NATIVE)
         os.replace(NATIVE + "/onnxruntime-win-x64-" + ORT_VERSION, ort_dir)
