@@ -31,6 +31,8 @@ public final class TransposeNative implements VocalSeparator {
     private volatile long stftHandle;
     private volatile long modelHandle;
     private volatile boolean modelLoading;
+    private volatile boolean pending;
+    private volatile boolean inferenceFailed;
     private int diagCount;
 
     private final String modelPath;
@@ -51,6 +53,7 @@ public final class TransposeNative implements VocalSeparator {
 
     @Override public boolean isSupported() { return supported; }
     @Override public boolean isReady() { return modelHandle != 0L && stftHandle != 0L; }
+    @Override public boolean isPending() { return pending; }
 
     @Override public void prewarm() {
         if (!supported || modelHandle != 0L || modelLoading) return;
@@ -113,7 +116,13 @@ public final class TransposeNative implements VocalSeparator {
         if (diagCount < 30) logDiag("separate frames=" + frames + " wantBytes=" + wantBytes
                 + " vocalAvail=" + vocalAvail + " inputAvail=" + inputRing.available()
                 + " stft=" + stftHandle + " model=" + modelHandle);
-        if (vocalAvail < wantBytes) return false;
+        if (vocalAvail < wantBytes) {
+            // pending only when inference itself is healthy; a real failure must
+            // surface as DEGRADED so the UI/telemetry are honest.
+            pending = !inferenceFailed;
+            return false;
+        }
+        pending = false;
         byte[] out = readBytes(wantBytes);
         for (int i = 0; i < need; i++) {
             int lo = out[i * 2] & 0xFF;
@@ -136,6 +145,12 @@ public final class TransposeNative implements VocalSeparator {
     }
 
     private boolean processChunk() {
+        boolean ok = processChunkInner();
+        inferenceFailed = !ok;
+        return ok;
+    }
+
+    private boolean processChunkInner() {
         pcmChunk.clear();
         pcmChunk.put(dryChunk, 0, CHUNK_SAMPLES * bytesPerFrame).flip();
         int frames = VocalRemovalProcessor.computeStft(
@@ -200,6 +215,8 @@ public final class TransposeNative implements VocalSeparator {
     @Override public void flush() {
         if (inputRing != null) inputRing.clear();
         vocalRead = vocalWrite = vocalAvail = 0;
+        inferenceFailed = false;
+        pending = false;
     }
 
     @Override public void close() {

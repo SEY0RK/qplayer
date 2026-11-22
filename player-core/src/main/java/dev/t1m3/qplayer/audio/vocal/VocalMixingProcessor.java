@@ -146,6 +146,14 @@ public final class VocalMixingProcessor {
             ok = false;
         }
         if (!ok) {
+            // A stream separator needs to fill its latency window before it can
+            // emit the first aligned block. That is NOT a failure: keep feeding it,
+            // pass dry PCM through, and stay in WARMUP so we recover by itself.
+            if (separator.isPending()) {
+                state = VocalProcessorState.WARMUP;
+                fallbackFrames.addAndGet(frames);
+                return;
+            }
             state = VocalProcessorState.DEGRADED;
             fallbackFrames.addAndGet(frames);
             return;

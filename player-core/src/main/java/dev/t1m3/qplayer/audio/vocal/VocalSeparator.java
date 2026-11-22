@@ -45,6 +45,13 @@ public interface VocalSeparator extends AutoCloseable {
      */
     default boolean configure(int sampleRate, int channels) { return true; }
 
+    /**
+     * True when {@link #separate} returned false only because the internal latency
+     * buffer is not full yet — NOT because inference failed. The caller must keep
+     * feeding audio and fall back to dry PCM without entering DEGRADED.
+     */
+    default boolean isPending() { return false; }
+
     /** Drop buffered state on seek / track change. */
     void flush();
 
