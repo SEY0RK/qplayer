@@ -5,7 +5,7 @@ import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.util.Log;
 
-import dev.t1m3.qplayer.audio.vocal.VocalRemovalProcessor;
+import com.example.media.audio.VocalRemovalProcessor;
 
 import java.io.File;
 import java.io.FileOutputStream;
