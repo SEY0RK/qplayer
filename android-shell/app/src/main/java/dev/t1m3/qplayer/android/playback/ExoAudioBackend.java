@@ -78,6 +78,12 @@ public final class ExoAudioBackend implements AudioBackend {
     private volatile boolean cIsPlaying;
     private volatile long cPositionMs;
     private volatile long cDurationMs;
+    /**
+     * Content position at the moment separation first engaged. The delay window
+     * fills with silence, so the raw "decoder - delay" reading would slide backwards
+     * below this; clamping keeps the UI showing a buffering hold instead of rewinding.
+     */
+    private volatile long engageFloorMs = -1;
 
     private volatile Runnable onComplete, onStarted, onPaused, onResumed, onError;
 
@@ -89,13 +95,31 @@ public final class ExoAudioBackend implements AudioBackend {
         @Override public void run() {
             ExoPlayer p = player;
             if (p != null) {
-                cPositionMs = Math.max(0L, p.getCurrentPosition());
+                // Audio is emitted `activeDelayMs` behind the decoder, so the UI (and
+                // therefore the lyric clock) must be pulled back by the same amount.
+                long delay = vocalProcessor.activeDelayMs();
+                long pos = Math.max(0L, p.getCurrentPosition() - delay);
+                long floor = engageFloorMs;
+                if (floor >= 0 && pos < floor) pos = floor;
+                cPositionMs = pos;
                 long d = p.getDuration();
                 cDurationMs = d > 0 ? d : 0L;
             }
             mainHandler.postDelayed(this, POSITION_POLL_MS);
         }
     };
+
+    /** Decoder target that will make the delayed output land on {@code contentMs}. */
+    private long decoderTargetFor(long contentMs) {
+        long delay = vocalProcessor.activeDelayMs();
+        long target = contentMs + delay;
+        ExoPlayer p = player;
+        if (p != null) {
+            long dur = p.getDuration();
+            if (dur > 0 && target > dur - 200) target = Math.max(0L, dur - 200);
+        }
+        return target;
+    }
 
     public ExoAudioBackend(Context ctx) {
         this.appContext = ctx.getApplicationContext();
@@ -162,6 +186,7 @@ public final class ExoAudioBackend implements AudioBackend {
         cIsPlaying = false;
         cPositionMs = pendingSeekMs;
         cDurationMs = 0L;
+        engageFloorMs = -1;
         requestFocus();
 
         final ExoPlayer exo = buildPlayer();
@@ -180,7 +205,7 @@ public final class ExoAudioBackend implements AudioBackend {
                 if (state == Player.STATE_READY && !prepared) {
                     prepared = true;
                     applyVolume();
-                    if (pendingSeekMs > 0L) exo.seekTo(pendingSeekMs);
+                    if (pendingSeekMs > 0L) exo.seekTo(decoderTargetFor(pendingSeekMs));
                     if (wantPlay) {
                         exo.play();
                         holdWifiLock(source);
@@ -207,7 +232,7 @@ public final class ExoAudioBackend implements AudioBackend {
         });
 
         exo.setMediaSource(ms);
-        if (pendingSeekMs > 0L) exo.seekTo(pendingSeekMs);
+        if (pendingSeekMs > 0L) exo.seekTo(decoderTargetFor(pendingSeekMs));
         exo.prepare();
     }
 
@@ -270,7 +295,8 @@ public final class ExoAudioBackend implements AudioBackend {
         runOnMain(() -> {
             pendingSeekMs = target;
             cPositionMs = target;
-            if (player != null && prepared) player.seekTo(target);
+            engageFloorMs = -1;   // new base after a seek; recomputed when needed
+            if (player != null && prepared) player.seekTo(decoderTargetFor(target));
         });
     }
 
@@ -346,8 +372,14 @@ public final class ExoAudioBackend implements AudioBackend {
     /** Master switch: off returns to the cursor-matched dry PCM, never newest input. */
     @Override
     public void setVocalOn(final boolean on) {
+        boolean firstEngage = on && !vocalProcessor.isEngaged();
         vocalEnabled = on;
         vocalProcessor.setEnabled(on);
+        if (firstEngage) {
+            // Hold the reported position at the current content spot while the delay
+            // window fills, otherwise the progress bar would rewind a second.
+            engageFloorMs = cPositionMs;
+        }
     }
 
     @Override

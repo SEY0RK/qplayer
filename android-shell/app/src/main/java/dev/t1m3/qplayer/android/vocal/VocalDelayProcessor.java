@@ -43,6 +43,13 @@ public final class VocalDelayProcessor implements AudioProcessor {
     private volatile int delayFrames = 66_150;        // 1.5 s @ 44.1 kHz, refined at runtime
     private volatile boolean enabled;
     private volatile float slider = 0.5f;
+    /**
+     * Delay becomes permanent once separation has been switched on: tearing it down
+     * on every toggle would reintroduce the jump the delay exists to prevent.
+     * Until then the processor is a zero-latency pass-through, so listeners who
+     * never touch separation are unaffected.
+     */
+    private volatile boolean engaged;
 
     private final String modelPath;
     private volatile StreamingSeparator engine;
@@ -84,12 +91,18 @@ public final class VocalDelayProcessor implements AudioProcessor {
     public void setEnabled(boolean on) {
         if (this.enabled == on) return;
         this.enabled = on;
+        if (on) engaged = true;
         // No buffer flush either way. Dry history is kept, the separated queue is
         // kept, and the blend simply ramps to the other side at the CURRENT cursor
         // — which is what makes the toggle seamless in both directions.
         Log.i(TAG, "enabled=" + on + " at outputCursor=" + outputCursor
-                + " blend=" + sepBlend);
+                + " blend=" + sepBlend + " engaged=" + engaged);
     }
+
+    /** Latency the UI must subtract from the player position; 0 before first use. */
+    public int activeDelayMs() { return engaged ? delayMs() : 0; }
+
+    public boolean isEngaged() { return engaged; }
 
     public void setSlider(float p) {
         if (Float.isNaN(p)) p = 0.5f;
@@ -173,6 +186,21 @@ public final class VocalDelayProcessor implements AudioProcessor {
             work[i] = (short) (lo | (hi << 8));
         }
         if (in.hasRemaining()) in.position(in.limit());
+
+        // Zero-latency path: separation has never been used this session, so there is
+        // nothing to align and no reason to delay or run inference.
+        if (!engaged) {
+            ByteBuffer direct = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder());
+            for (int i = 0; i < samples; i++) {
+                short v = work[i];
+                direct.put((byte) (v & 0xFF)).put((byte) ((v >> 8) & 0xFF));
+            }
+            direct.flip();
+            outputBuffer = direct;
+            outputCursor += frames;
+            inputCursor += frames;
+            return;
+        }
 
         // 1. Append dry to the delay ring.
         writeDry(work, samples, ch);
