@@ -36,8 +36,8 @@ public final class VocalDelayProcessor implements AudioProcessor {
 
     /** Cross-fade length when swapping dry <-> separated. */
     private static final int XFADE_FRAMES = 882;      // 20 ms @ 44.1 kHz
-    /** Queue depth guard: keep at most this many blocks ahead. */
-    private static final int MAX_QUEUE = 6;
+    /** Queue depth guard: 16 blocks ≈ 8.8 s of headroom against short excursions. */
+    private static final int MAX_QUEUE = 16;
 
     // ---- configuration ---------------------------------------------------
     private volatile int delayFrames = 66_150;        // 1.5 s @ 44.1 kHz, refined at runtime
@@ -210,14 +210,15 @@ public final class VocalDelayProcessor implements AudioProcessor {
         StreamingSeparator eng = engine;
         if (eng != null && eng.isReady()) {
             eng.feed(work, 0, frames);
-            while (queue.size() < MAX_QUEUE) {
-                StreamingSeparator.Segment seg = eng.poll();
-                if (seg == null) break;
+            // Drain UNCONDITIONALLY. Stopping the drain when the output queue looked
+            // full left blocks inside the engine, whose input ring then overran and
+            // dropped source frames — producing positional holes that guaranteed
+            // starvation. Bounding the output queue here instead is safe.
+            StreamingSeparator.Segment seg;
+            while ((seg = eng.poll()) != null) {
+                if (seg.endFrame() <= outputCursor) continue;      // already played past
+                while (queue.size() >= MAX_QUEUE) queue.pollFirst();
                 queue.addLast(seg);
-            }
-            // Drop blocks that are entirely behind the cursor.
-            while (!queue.isEmpty() && queue.peekFirst().endFrame() <= outputCursor) {
-                queue.pollFirst();
             }
         }
 
