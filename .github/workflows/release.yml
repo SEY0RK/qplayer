@@ -51,6 +51,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
+      - name: Set up Android NDK
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          test -n "$ANDROID_NDK_HOME" && test -d "$ANDROID_NDK_HOME"
+      - name: Fetch vocal separation native assets (GPL-3.0 Transpose)
+        run: python .github/scripts/fetch-vocal-assets.py
       - name: Checkout patched qml4j engine
         uses: actions/checkout@v4
         with:

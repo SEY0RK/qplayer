@@ -76,6 +76,11 @@
             </intent-filter>
         </activity>
 
+        <!-- SPIKE: adb-launched ExoPlayer+JNI vocal separation self-test. -->
+        <activity
+            android:name="dev.t1m3.qplayer.android.spike.VocalSpikeActivity"
+            android:exported="true" />
+
         <activity
             android:name="dev.t1m3.qplayer.android.ui.SourceWebLoginActivity"
             android:exported="false"

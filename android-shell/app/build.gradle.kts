@@ -11,6 +11,7 @@ val okhttpVersion = qplayerPom.getElementsByTagName("okhttp.version").item(0).te
 android {
     namespace = "io.github.timer_err.qml4j.android"
     compileSdk = 34
+        ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "dev.t1m3.qplayer"
@@ -19,6 +20,16 @@ android {
         versionCode = 114
         versionName = "2.1.1"
         manifestPlaceholders["appLabel"] = "QPlayer"
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+            abiFilters += listOf("arm64-v8a")
+            arguments += listOf("-DANDROID_PLATFORM=android-26", "-DANDROID_STL=c++_static")
+            cppFlags += listOf("-O3", "-fsigned-char")
+        }
     }
 
     compileOptions {
@@ -200,6 +211,9 @@ dependencies {
     implementation("io.github.humbleui:skija-android-arm64:0.143.17")
 
     implementation("androidx.appcompat:appcompat:1.7.0")
+    // SPIKE: Media3 ExoPlayer + AudioProcessor chain for vocal separation.
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-common:1.4.1")
 
     // MediaSessionCompat + MediaStyle notification + media-button handling for
     // system media controls (lockscreen / notification / bluetooth).
