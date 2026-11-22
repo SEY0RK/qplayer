@@ -7,13 +7,20 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 /**
- * SPIKE ExoPlayer AudioProcessor that bridges Media3 PCM into our platform-neutral
- * {@link VocalMixingProcessor}. Only PCM_16BIT is accepted (matching Transpose).
+ * ExoPlayer {@link AudioProcessor} bridging Media3 PCM into the platform-neutral
+ * {@link VocalMixingProcessor}. PCM_16BIT only (matching the native separator).
  *
- * <p>Spike scope: verifies ExoPlayer -> AudioProcessor -> JNI separator -> mixer
- * runs end to end. It is NOT wired into QPlayer's main playback UI yet.
+ * <p>Contract correctness matters here: Media3 requires that
+ * <ul>
+ *   <li>{@code queueInput} consumes the WHOLE input buffer between position and limit;</li>
+ *   <li>the buffer returned by {@code getOutput()} stays valid until the sink has
+ *       drained it — so each block gets its own direct buffer instead of reusing one.</li>
+ * </ul>
  */
 public final class VocalExoAudioProcessor implements AudioProcessor {
+
+    private static final String TAG = "VocalExo";
+    private static final boolean DIAG = true;
 
     private final VocalMixingProcessor mixer;
 
@@ -23,8 +30,9 @@ public final class VocalExoAudioProcessor implements AudioProcessor {
     private boolean inputEnded;
 
     private short[] scratch = new short[0];
-    private ByteBuffer outDirect = ByteBuffer.allocateDirect(0).order(ByteOrder.nativeOrder());
-    private boolean configuredSeparator;
+    private int configuredChannels = -1;
+    private int configuredRate = -1;
+    private int diagCount;
 
     public VocalExoAudioProcessor(VocalMixingProcessor mixer) {
         this.mixer = mixer;
@@ -41,14 +49,14 @@ public final class VocalExoAudioProcessor implements AudioProcessor {
         }
         inputFormat = in;
         outputFormat = in;
-        int maxSamples = in.sampleRate * 2 * in.channelCount; // 1 second
-        scratch = new short[maxSamples];
-        outDirect = ByteBuffer.allocateDirect(maxSamples * 2).order(ByteOrder.nativeOrder());
-        if (!configuredSeparator) {
-            // The native separator needs the sample rate/channels to build its STFT;
-            // without this isReady() stays false forever and everything falls back.
+        if (in.channelCount != configuredChannels || in.sampleRate != configuredRate) {
+            int maxSamples = in.sampleRate * 2 * in.channelCount; // ~1s headroom
+            scratch = new short[maxSamples];
+            configuredChannels = in.channelCount;
+            configuredRate = in.sampleRate;
             mixer.configureSeparator(in.sampleRate, in.channelCount);
-            configuredSeparator = true;
+            diag("configure rate=" + in.sampleRate + " ch=" + in.channelCount
+                    + " sepReady=" + mixer.isReady() + " supported=" + mixer.isSupported());
         }
         return outputFormat;
     }
@@ -59,27 +67,57 @@ public final class VocalExoAudioProcessor implements AudioProcessor {
     public void queueInput(ByteBuffer in) {
         int bytes = in.remaining();
         if (bytes <= 0) { outputBuffer = EMPTY_BUFFER; return; }
-        int frames = bytes / (inputFormat.channelCount * 2);
+
+        int bytesPerFrame = inputFormat.channelCount * 2;
+        int frames = bytes / bytesPerFrame;
         int samples = frames * inputFormat.channelCount;
-        if (samples > scratch.length) {
-            scratch = new short[samples];
-            outDirect = ByteBuffer.allocateDirect(samples * 2).order(ByteOrder.nativeOrder());
-        }
+        int consumedBytes = frames * bytesPerFrame;   // may be < bytes if a partial frame trails
+
+        if (samples > scratch.length) scratch = new short[samples];
+
         for (int i = 0; i < samples; i++) {
             int lo = in.get() & 0xFF;
             int hi = in.get() & 0xFF;
             scratch[i] = (short) (lo | (hi << 8));
         }
-        mixer.process(scratch, frames, inputFormat.sampleRate);
+        // Consume any trailing partial frame so the buffer is fully drained.
+        if (in.hasRemaining()) in.position(in.limit());
 
-        outDirect.clear();
+        long beforeRms = rms(scratch, samples);
+        mixer.process(scratch, frames, inputFormat.sampleRate);
+        long afterRms = rms(scratch, samples);
+
+        // One buffer per block: never overwrite data the sink may still hold.
+        ByteBuffer out = ByteBuffer.allocateDirect(consumedBytes + (bytes - consumedBytes))
+                .order(ByteOrder.nativeOrder());
         for (int i = 0; i < samples; i++) {
             short s = scratch[i];
-            outDirect.put((byte) (s & 0xFF));
-            outDirect.put((byte) ((s >> 8) & 0xFF));
+            out.put((byte) (s & 0xFF));
+            out.put((byte) ((s >> 8) & 0xFF));
         }
-        outDirect.flip();
-        outputBuffer = outDirect;
+        out.flip();
+        outputBuffer = out;
+
+        if (DIAG && diagCount < 60) {
+            diagCount++;
+            diag("queue bytes=" + bytes + " frames=" + frames
+                    + " state=" + mixer.state() + " slider=" + mixer.slider()
+                    + " rmsIn=" + beforeRms + " rmsOut=" + afterRms
+                    + " outBytes=" + out.remaining());
+        }
+    }
+
+    private static long rms(short[] buf, int n) {
+        if (n <= 0) return 0;
+        long sum = 0;
+        int step = Math.max(1, n / 512);   // sample ~512 points, cheap
+        int count = 0;
+        for (int i = 0; i < n; i += step) {
+            long v = buf[i];
+            sum += v * v;
+            count++;
+        }
+        return count == 0 ? 0 : (long) Math.sqrt((double) sum / count);
     }
 
     @Override public void queueEndOfStream() { inputEnded = true; }
@@ -98,11 +136,22 @@ public final class VocalExoAudioProcessor implements AudioProcessor {
         inputEnded = false;
         outputBuffer = EMPTY_BUFFER;
         mixer.flush();
+        diag("flush");
     }
 
     @Override public void reset() {
         flush();
         inputFormat = AudioFormat.NOT_SET;
         outputFormat = AudioFormat.NOT_SET;
+        configuredChannels = -1;
+        configuredRate = -1;
+        diag("reset");
+    }
+
+    private void diag(String msg) {
+        if (!DIAG) return;
+        try {
+            android.util.Log.i(TAG, msg);
+        } catch (Throwable ignored) { }
     }
 }

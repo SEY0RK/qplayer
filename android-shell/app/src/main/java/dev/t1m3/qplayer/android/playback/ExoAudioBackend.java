@@ -1,5 +1,23 @@
 package dev.t1m3.qplayer.android.playback;
 
+/**
+ * THREADING NOTE — this is why the class is shaped the way it is.
+ *
+ * <p>Media3's ExoPlayer throws {@code IllegalStateException: Player is accessed on
+ * the wrong thread} for ANY access from a thread other than its application looper.
+ * QPlayer's {@code PlayerController.pump()} runs on the QML GL render thread and
+ * calls {@code isPlaying()} / {@code position()} on every frame. A direct
+ * pass-through backend therefore killed the render thread (QML error page) and
+ * audio never started.
+ *
+ * <p>Rules enforced here:
+ * <ul>
+ *   <li>the player is created on, and only ever touched from, the main looper;</li>
+ *   <li>{@code isPlaying()} / {@code position()} / {@code duration()} answer from
+ *       volatile caches and never touch the player.</li>
+ * </ul>
+ */
+
 import android.content.Context;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
@@ -7,21 +25,19 @@ import android.media.AudioManager;
 import android.net.wifi.WifiManager;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.PowerManager;
 
-import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.audio.AudioProcessor;
 import androidx.media3.common.audio.AudioProcessorChain;
 import androidx.media3.common.PlaybackParameters;
+import androidx.media3.datasource.DefaultDataSource;
+import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
-import androidx.media3.datasource.DefaultDataSource;
-import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.source.MediaSource;
 import androidx.media3.exoplayer.source.ProgressiveMediaSource;
 
@@ -35,26 +51,17 @@ import java.io.File;
 import java.util.Collections;
 import java.util.Map;
 
-/**
- * {@link AudioBackend} over Media3 ExoPlayer. Replaces the MediaPlayer backend so
- * that a real-time {@link AudioProcessor} chain can run on decoded PCM — the
- * prerequisite for vocal separation (MediaPlayer exposes no PCM).
- *
- * <p>Preserves the MediaPlayer backend's contract: async prepare + initial seek,
- * exact seek, audio focus (pause on loss, duck on transient), WifiLock +
- * PARTIAL_WAKE_LOCK for background streaming, a stall watchdog, a growing-cache
- * handoff, and all callbacks. DEFAULT path (separation off) is a transparent pass.
- *
- * <p>The model file is copied from assets to filesDir/vocal on first use.
- */
+/** {@link AudioBackend} over Media3 ExoPlayer, with main-thread confinement. */
 public final class ExoAudioBackend implements AudioBackend {
+
+    private static final long POSITION_POLL_MS = 50L;
 
     private final Context appContext;
     private final AudioManager audioManager;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+    // --- main-thread-only player state -------------------------------------
     private ExoPlayer player;
-    private MediaSource currentSource;
     private String source;
     private Map<String, String> sourceHeaders = Collections.emptyMap();
     private long pendingSeekMs;
@@ -65,15 +72,33 @@ public final class ExoAudioBackend implements AudioBackend {
     private boolean hasFocus;
     private boolean resumeOnGain;
     private long playbackGeneration;
-
-    private Runnable onComplete, onStarted, onPaused, onResumed, onError;
-    private String cachePendingPath, cacheCompletePath;
+    private String cacheCompletePath;
     private WifiManager.WifiLock wifiLock;
+    private AudioFocusRequest focusRequest;
 
-    // ---- vocal separation -------------------------------------------------
+    // --- caches readable from any thread -----------------------------------
+    private volatile boolean cIsPlaying;
+    private volatile long cPositionMs;
+    private volatile long cDurationMs;
+
+    private volatile Runnable onComplete, onStarted, onPaused, onResumed, onError;
+
+    // --- vocal separation --------------------------------------------------
     private final VocalMixingProcessor mixer;
     private final VocalExoAudioProcessor vocalProcessor;
     private volatile boolean vocalEnabled;
+
+    private final Runnable positionPoll = new Runnable() {
+        @Override public void run() {
+            ExoPlayer p = player;
+            if (p != null) {
+                cPositionMs = Math.max(0L, p.getCurrentPosition());
+                long d = p.getDuration();
+                cDurationMs = d > 0 ? d : 0L;
+            }
+            mainHandler.postDelayed(this, POSITION_POLL_MS);
+        }
+    };
 
     public ExoAudioBackend(Context ctx) {
         this.appContext = ctx.getApplicationContext();
@@ -88,6 +113,7 @@ public final class ExoAudioBackend implements AudioBackend {
         TransposeNative separator = new TransposeNative(model.getAbsolutePath());
         this.mixer = new VocalMixingProcessor(separator);
         this.vocalProcessor = new VocalExoAudioProcessor(mixer);
+        mainHandler.postDelayed(positionPoll, POSITION_POLL_MS);
     }
 
     private void copyModelFromAssets(File dst) {
@@ -106,29 +132,44 @@ public final class ExoAudioBackend implements AudioBackend {
         }
     }
 
-    // ---- AudioBackend -----------------------------------------------------
+    private void runOnMain(Runnable r) {
+        if (Looper.myLooper() == Looper.getMainLooper()) r.run();
+        else mainHandler.post(r);
+    }
+
+    // ---- playback ---------------------------------------------------------
 
     @Override
-    public synchronized void play(String src, long startMs) {
+    public void play(String src, long startMs) {
         play(src, Collections.emptyMap(), startMs);
     }
 
     @Override
-    public synchronized void play(String src, Map<String, String> headers, long startMs) {
+    public void play(String src, Map<String, String> headers, final long startMs) {
         if (src == null || src.isEmpty()) return;
+        final String fSrc = src;
+        final Map<String, String> fHeaders = headers == null || headers.isEmpty()
+                ? Collections.<String, String>emptyMap()
+                : Collections.unmodifiableMap(new java.util.LinkedHashMap<>(headers));
+        runOnMain(() -> playOnMain(fSrc, fHeaders, startMs));
+    }
+
+    private void playOnMain(String src, Map<String, String> headers, long startMs) {
         playbackGeneration++;
-        long generation = playbackGeneration;
-        releasePlayer();
-        this.source = src;
-        this.sourceHeaders = headers == null || headers.isEmpty()
-                ? Collections.emptyMap() : Collections.unmodifiableMap(new java.util.LinkedHashMap<>(headers));
-        this.pendingSeekMs = Math.max(0L, startMs);
-        this.wantPlay = true;
-        this.prepared = false;
-        this.cacheCompletePath = null;
+        final long generation = playbackGeneration;
+        releasePlayerOnMain();
+        source = src;
+        sourceHeaders = headers;
+        pendingSeekMs = Math.max(0L, startMs);
+        wantPlay = true;
+        prepared = false;
+        cacheCompletePath = null;
+        cIsPlaying = false;
+        cPositionMs = pendingSeekMs;
+        cDurationMs = 0L;
         requestFocus();
 
-        ExoPlayer exo = buildPlayer();
+        final ExoPlayer exo = buildPlayer();
         player = exo;
 
         DefaultHttpDataSource.Factory http = new DefaultHttpDataSource.Factory()
@@ -137,7 +178,6 @@ public final class ExoAudioBackend implements AudioBackend {
         DefaultDataSource.Factory ds = new DefaultDataSource.Factory(appContext, http);
         MediaSource ms = new ProgressiveMediaSource.Factory(ds)
                 .createMediaSource(MediaItem.fromUri(src));
-        currentSource = ms;
 
         exo.addListener(new Player.Listener() {
             @Override public void onPlaybackStateChanged(int state) {
@@ -145,27 +185,28 @@ public final class ExoAudioBackend implements AudioBackend {
                 if (state == Player.STATE_READY && !prepared) {
                     prepared = true;
                     applyVolume();
-                    long seek = pendingSeekMs;
-                    if (seek > 0L) {
-                        exo.seekTo(seek);
-                    }
+                    if (pendingSeekMs > 0L) exo.seekTo(pendingSeekMs);
                     if (wantPlay) {
                         exo.play();
                         holdWifiLock(source);
-                        if (onStarted != null) onStarted.run();
+                        Runnable cb = onStarted;
+                        if (cb != null) cb.run();
                     }
                 } else if (state == Player.STATE_ENDED) {
-                    if (onComplete != null) onComplete.run();
+                    cIsPlaying = false;
+                    Runnable cb = onComplete;
+                    if (cb != null) cb.run();
                 }
             }
             @Override public void onPlayerError(PlaybackException error) {
                 if (generation != playbackGeneration || player != exo) return;
                 Logger.error("ExoPlayer error: {}", error.toString());
                 wantPlay = false;
-                failPlayback();
+                failPlaybackOnMain();
             }
             @Override public void onIsPlayingChanged(boolean playing) {
                 if (generation != playbackGeneration || player != exo) return;
+                cIsPlaying = playing;
                 if (playing) holdWifiLock(source);
             }
         });
@@ -197,63 +238,57 @@ public final class ExoAudioBackend implements AudioBackend {
                         .build();
             }
         };
-        ExoPlayer exo = new ExoPlayer.Builder(appContext, rf).build();
-        exo.setWakeMode(C.WAKE_MODE_LOCAL); // we hold our own PARTIAL_WAKE_LOCK
-        return exo;
+        // Built on the main looper; every later call is marshalled there too.
+        return new ExoPlayer.Builder(appContext, rf).build();
     }
 
-    private void failPlayback() {
+    private void failPlaybackOnMain() {
         releaseWifiLock();
-        releasePlayer();
-        if (onError != null) {
-            Runnable err = onError;
-            mainHandler.post(() -> { if (err != null) err.run(); });
-        }
+        releasePlayerOnMain();
+        cIsPlaying = false;
+        final Runnable cb = onError;
+        if (cb != null) mainHandler.post(cb);
     }
 
-    @Override
-    public synchronized void pause() {
-        wantPlay = false;
-        releaseWifiLock();
-        if (player != null) player.pause();
+    @Override public void pause() {
+        runOnMain(() -> {
+            wantPlay = false;
+            releaseWifiLock();
+            if (player != null) player.pause();
+            cIsPlaying = false;
+        });
     }
 
-    @Override
-    public synchronized void resume() {
-        wantPlay = true;
-        requestFocus();
-        if (player != null && prepared) player.play();
+    @Override public void resume() {
+        runOnMain(() -> {
+            wantPlay = true;
+            requestFocus();
+            if (player != null && prepared) player.play();
+        });
     }
 
-    @Override
-    public synchronized boolean isPlaying() {
-        return player != null && player.isPlaying();
+    /** Cache-backed: safe to call from the QML render thread every frame. */
+    @Override public boolean isPlaying() { return cIsPlaying; }
+
+    @Override public void seek(final long ms) {
+        final long target = Math.max(0L, ms);
+        runOnMain(() -> {
+            pendingSeekMs = target;
+            cPositionMs = target;
+            if (player != null && prepared) player.seekTo(target);
+        });
     }
 
-    @Override
-    public synchronized void seek(long ms) {
-        long target = Math.max(0L, ms);
-        pendingSeekMs = target;
-        if (player != null && prepared) player.seekTo(target);
-    }
+    @Override public long position() { return cPositionMs; }
 
-    @Override
-    public synchronized long position() {
-        if (player == null) return pendingSeekMs;
-        return Math.max(0L, player.getCurrentPosition());
-    }
+    @Override public long duration() { return cDurationMs; }
 
-    @Override
-    public synchronized long duration() {
-        if (player == null || !prepared) return 0L;
-        long d = player.getDuration();
-        return d > 0 ? d : 0L;
-    }
-
-    @Override
-    public synchronized void setVolume(float v) {
-        volume = Math.max(0f, Math.min(1f, v));
-        applyVolume();
+    @Override public void setVolume(final float v) {
+        final float clamped = Math.max(0f, Math.min(1f, v));
+        runOnMain(() -> {
+            volume = clamped;
+            applyVolume();
+        });
     }
 
     private void applyVolume() {
@@ -261,68 +296,71 @@ public final class ExoAudioBackend implements AudioBackend {
         player.setVolume(ducked ? volume * 0.3f : volume);
     }
 
-    @Override public synchronized void setOnStarted(Runnable cb) { this.onStarted = cb; }
-    @Override public synchronized void setOnPaused(Runnable cb) { this.onPaused = cb; }
-    @Override public synchronized void setOnResumed(Runnable cb) { this.onResumed = cb; }
-    @Override public synchronized void setOnError(Runnable cb) { this.onError = cb; }
-    @Override public synchronized void setOnComplete(Runnable cb) { this.onComplete = cb; }
+    @Override public void setOnStarted(Runnable cb) { this.onStarted = cb; }
+    @Override public void setOnPaused(Runnable cb) { this.onPaused = cb; }
+    @Override public void setOnResumed(Runnable cb) { this.onResumed = cb; }
+    @Override public void setOnError(Runnable cb) { this.onError = cb; }
+    @Override public void setOnComplete(Runnable cb) { this.onComplete = cb; }
 
     @Override
-    public synchronized void bindGrowingCache(String pendingPath, String completePath, long durationMs) {
-        this.cacheCompletePath = completePath;
+    public void bindGrowingCache(String pendingPath, final String completePath, long durationMs) {
+        runOnMain(() -> cacheCompletePath = completePath);
     }
 
     @Override
-    public synchronized void notifyCacheComplete() {
-        // A finished cache can be handed to ExoPlayer as a new source at the same
-        // position. Only when the live stream is actually the active one.
-        if (source != null && (source.startsWith("http://") || source.startsWith("https://"))) {
+    public void notifyCacheComplete() {
+        runOnMain(() -> {
+            if (source == null) return;
+            if (!(source.startsWith("http://") || source.startsWith("https://"))) return;
             String path = cacheCompletePath;
-            if (path != null && !path.equals(source)) {
-                File f = new File(path);
-                if (f.isFile() && f.length() > 0 && wantPlay) {
-                    long pos = position();
-                    Logger.info("ExoPlayer: switching to complete cache at {}ms", pos);
-                    play(path, Collections.emptyMap(), pos);
-                }
-            }
-        }
+            if (path == null || path.equals(source)) return;
+            File f = new File(path);
+            if (!f.isFile() || f.length() == 0 || !wantPlay) return;
+            long pos = position();
+            Logger.info("ExoPlayer: switching to complete cache at {}ms", pos);
+            playOnMain(path, Collections.<String, String>emptyMap(), pos);
+        });
     }
 
     @Override
-    public synchronized void release() {
-        playbackGeneration++;
-        onComplete = onStarted = onPaused = onResumed = onError = null;
-        releaseWifiLock();
-        releasePlayer();
-        abandonFocus();
-        mixer.close();
+    public void release() {
+        mainHandler.removeCallbacks(positionPoll);
+        runOnMain(() -> {
+            playbackGeneration++;
+            onComplete = onStarted = onPaused = onResumed = onError = null;
+            releaseWifiLock();
+            releasePlayerOnMain();
+            abandonFocus();
+            mixer.close();
+            cIsPlaying = false;
+        });
     }
 
-    private void releasePlayer() {
+    private void releasePlayerOnMain() {
         if (player != null) {
-            try {
-                player.release();
-            } catch (Throwable ignored) { }
+            try { player.release(); } catch (Throwable ignored) { }
             player = null;
         }
-        currentSource = null;
         prepared = false;
+        cIsPlaying = false;
     }
 
-    // ---- vocal mix control -------------------------------------------------
+    // ---- vocal mix control ------------------------------------------------
 
     @Override public boolean supportsVocalMix() { return true; }
 
-    /** 0..100 slider. 50 = strict raw passthrough. */
-    @Override public synchronized void setVocalMix(int percent) {
-        float p = Math.max(0f, Math.min(100f, percent)) / 100f;
-        mixer.setSlider(p);
-        boolean shouldEnable = Math.abs(p - 0.5f) > 0.001f;
-        if (shouldEnable != vocalEnabled) {
-            vocalEnabled = shouldEnable;
-            mixer.setEnabled(shouldEnable);
-        }
+    @Override
+    public void setVocalMix(final int percent) {
+        final int clamped = Math.max(0, Math.min(100, percent));
+        runOnMain(() -> {
+            float p = clamped / 100f;
+            mixer.setSlider(p);
+            boolean shouldEnable = Math.abs(p - 0.5f) > 0.001f;
+            if (shouldEnable != vocalEnabled) {
+                vocalEnabled = shouldEnable;
+                mixer.setEnabled(shouldEnable);
+            }
+        });
     }
 
     @Override public int vocalState() { return mixer.state().ordinal(); }
@@ -330,7 +368,7 @@ public final class ExoAudioBackend implements AudioBackend {
     @Override public long vocalProcessedFrames() { return mixer.processedFrames(); }
     @Override public long vocalFallbackFrames() { return mixer.fallbackFrames(); }
 
-    // ---- audio focus ------------------------------------------------------
+    // ---- audio focus (main thread) ----------------------------------------
 
     private void requestFocus() {
         if (hasFocus || audioManager == null) return;
@@ -339,27 +377,34 @@ public final class ExoAudioBackend implements AudioBackend {
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                         .build())
-                .setOnAudioFocusChangeListener(this::onFocusChange)
+                .setOnAudioFocusChangeListener(this::onFocusChange, mainHandler)
                 .setWillPauseWhenDucked(false)
                 .build();
+        focusRequest = req;
         hasFocus = audioManager.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
     }
 
     private void abandonFocus() {
+        if (audioManager != null && focusRequest != null) {
+            audioManager.abandonAudioFocusRequest(focusRequest);
+        }
+        focusRequest = null;
         hasFocus = false;
         ducked = false;
         resumeOnGain = false;
     }
 
-    private synchronized void onFocusChange(int change) {
+    private void onFocusChange(int change) {
         switch (change) {
             case AudioManager.AUDIOFOCUS_LOSS:
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
                 hasFocus = false;
                 if (player != null && player.isPlaying()) {
                     player.pause();
+                    cIsPlaying = false;
                     resumeOnGain = true;
-                    if (onPaused != null) onPaused.run();
+                    Runnable cb = onPaused;
+                    if (cb != null) cb.run();
                 }
                 break;
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
@@ -375,7 +420,8 @@ public final class ExoAudioBackend implements AudioBackend {
                     resumeOnGain = false;
                     wantPlay = true;
                     player.play();
-                    if (onResumed != null) onResumed.run();
+                    Runnable cb = onResumed;
+                    if (cb != null) cb.run();
                 }
                 break;
             default: break;
