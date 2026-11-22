@@ -13,7 +13,7 @@ include_directories(${CMAKE_SOURCE_DIR})
 
 add_library(onnxruntime SHARED IMPORTED)
 set_target_properties(onnxruntime PROPERTIES
-    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/jniLibs/${ANDROID_ABI}/libonnxruntime.so)
+    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libonnxruntime.so)
 
 add_library(vocal_removal_native SHARED VocalRemovalNative.cpp)
 
