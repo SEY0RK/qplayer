@@ -490,8 +490,8 @@ public final class PlayerController {
     public final Property<Float> volume = new Property<>(0.8f);
     /** Vocal separation master switch; when off the original PCM is emitted. */
     public final Property<Boolean> vocalOn = new Property<>(false);
-    /** Blend 0..100: 0 = instrumental, 100 = vocals (midpoint = original mix). */
-    public final Property<Integer> vocalMix = new Property<>(0);
+    /** Blend 0..100: 0 = instrumental, 100 = vocals (50 = balanced / original mix). */
+    public final Property<Integer> vocalMix = new Property<>(50);
     /** Whether the active backend supports real-time vocal separation. */
     public final Property<Boolean> vocalSupported = new Property<>(false);
     /** 0=disabled 1=warmup 2=ready 3=processing 4=degraded -1=unsupported. */

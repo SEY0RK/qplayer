@@ -41,10 +41,9 @@ import androidx.media3.exoplayer.audio.DefaultAudioSink;
 import androidx.media3.exoplayer.source.MediaSource;
 import androidx.media3.exoplayer.source.ProgressiveMediaSource;
 
+import dev.t1m3.qplayer.android.vocal.VocalCacheProcessor;
+import dev.t1m3.qplayer.android.vocal.VocalCacheStore;
 import dev.t1m3.qplayer.audio.AudioBackend;
-import dev.t1m3.qplayer.audio.vocal.TransposeNative;
-import dev.t1m3.qplayer.audio.vocal.VocalExoAudioProcessor;
-import dev.t1m3.qplayer.audio.vocal.VocalMixingProcessor;
 import dev.t1m3.qplayer.util.Logger;
 
 import java.io.File;
@@ -83,10 +82,29 @@ public final class ExoAudioBackend implements AudioBackend {
 
     private volatile Runnable onComplete, onStarted, onPaused, onResumed, onError;
 
-    // --- vocal separation --------------------------------------------------
-    private final VocalMixingProcessor mixer;
-    private final VocalExoAudioProcessor vocalProcessor;
+    // --- vocal separation (pre-separated cache) ----------------------------
+    private final VocalCacheProcessor vocalProcessor;
+    private final VocalCacheStore cacheStore;
     private volatile boolean vocalEnabled;
+    private volatile boolean cachePreparing;
+    private volatile boolean cacheReady;
+
+    private final VocalCacheStore.Callback cacheCallback = new VocalCacheStore.Callback() {
+        @Override public void onProgress(String key, float fraction) { }
+        @Override public void onReady(String key, VocalCacheStore.Track t) {
+            mainHandler.post(() -> {
+                cachePreparing = false;
+                cacheReady = true;
+                if (source != null && key.equals(VocalCacheStore.keyOf(source))) {
+                    vocalProcessor.setCache(t.pcm, t.startFrame, t.endFrame,
+                            t.channels, t.sampleRate);
+                }
+            });
+        }
+        @Override public void onFailed(String key, String reason) {
+            mainHandler.post(() -> { cachePreparing = false; cacheReady = false; });
+        }
+    };
 
     private final Runnable positionPoll = new Runnable() {
         @Override public void run() {
@@ -110,9 +128,8 @@ public final class ExoAudioBackend implements AudioBackend {
         }
         File model = new File(appContext.getFilesDir(), "vocal/vocal_separation_core.bin");
         copyModelFromAssets(model);
-        TransposeNative separator = new TransposeNative(model.getAbsolutePath());
-        this.mixer = new VocalMixingProcessor(separator);
-        this.vocalProcessor = new VocalExoAudioProcessor(mixer);
+        this.cacheStore = new VocalCacheStore(appContext.getFilesDir(), model.getAbsolutePath());
+        this.vocalProcessor = new VocalCacheProcessor();
         mainHandler.postDelayed(positionPoll, POSITION_POLL_MS);
     }
 
@@ -160,6 +177,7 @@ public final class ExoAudioBackend implements AudioBackend {
         releasePlayerOnMain();
         source = src;
         sourceHeaders = headers;
+        attachVocalCacheFor(src);
         pendingSeekMs = Math.max(0L, startMs);
         wantPlay = true;
         prepared = false;
@@ -214,6 +232,30 @@ public final class ExoAudioBackend implements AudioBackend {
         exo.setMediaSource(ms);
         if (pendingSeekMs > 0L) exo.seekTo(pendingSeekMs);
         exo.prepare();
+    }
+
+    /** Attach an existing separated track, or queue an offline build for local files. */
+    private void attachVocalCacheFor(String src) {
+        VocalCacheStore.Track t = cacheStore.lookup(src);
+        if (t != null) {
+            vocalProcessor.setCache(t.pcm, t.startFrame, t.endFrame, t.channels, t.sampleRate);
+            cacheReady = true;
+            cachePreparing = false;
+            return;
+        }
+        vocalProcessor.setCache(null, 0, 0, 2, OFFLINE_SAMPLE_RATE);
+        cacheReady = false;
+        if (vocalEnabled && isLocalSource(src)) {
+            cachePreparing = true;
+            cacheStore.requestBuild(src, cacheCallback);
+        }
+    }
+
+    private static final int OFFLINE_SAMPLE_RATE = 44100;
+
+    private static boolean isLocalSource(String src) {
+        if (src == null || src.isEmpty()) return false;
+        return !(src.startsWith("http://") || src.startsWith("https://"));
     }
 
     private ExoPlayer buildPlayer() {
@@ -275,6 +317,9 @@ public final class ExoAudioBackend implements AudioBackend {
         runOnMain(() -> {
             pendingSeekMs = target;
             cPositionMs = target;
+            // Cache mixing is position-based; tell the processor where playback will
+            // resume so the very first block after the seek reads the right offset.
+            vocalProcessor.setBaseMs(target);
             if (player != null && prepared) player.seekTo(target);
         });
     }
@@ -316,6 +361,10 @@ public final class ExoAudioBackend implements AudioBackend {
             if (path == null || path.equals(source)) return;
             File f = new File(path);
             if (!f.isFile() || f.length() == 0 || !wantPlay) return;
+            // The finished download is a local file: start the offline pass now so a
+            // later play of this track can mix seamlessly, then hand playback over to
+            // the file (keeps the rest of the track off the network).
+            if (vocalEnabled) cacheStore.requestBuild(path, cacheCallback);
             long pos = position();
             Logger.info("ExoPlayer: switching to complete cache at {}ms", pos);
             playOnMain(path, Collections.<String, String>emptyMap(), pos);
@@ -331,7 +380,7 @@ public final class ExoAudioBackend implements AudioBackend {
             releaseWifiLock();
             releasePlayerOnMain();
             abandonFocus();
-            mixer.close();
+            cacheStore.shutdown();
             cIsPlaying = false;
         });
     }
@@ -349,27 +398,31 @@ public final class ExoAudioBackend implements AudioBackend {
 
     @Override public boolean supportsVocalMix() { return true; }
 
-    /** Master switch: off = raw passthrough and the pipeline is released. */
+    /** Master switch: off = raw passthrough, on = mix against the cached track. */
     @Override
     public void setVocalOn(final boolean on) {
-        if (on == vocalEnabled) return;
         vocalEnabled = on;
-        // setEnabled() touches separator.flush()/prewarm(), so marshal to main.
-        runOnMain(() -> mixer.setEnabled(on));
+        vocalProcessor.setEnabled(on);
+        if (on && !cacheReady && source != null) {
+            // Turning the switch on is the natural moment to start the offline pass.
+            runOnMain(() -> attachVocalCacheFor(source));
+        }
     }
 
     @Override
     public void setVocalMix(final int percent) {
-        final int clamped = Math.max(0, Math.min(100, percent));
-        // Plain volatile store — safe from the UI thread and must land BEFORE the
-        // next audio block, otherwise the slider lags a block behind.
-        mixer.setSlider(clamped / 100f);
+        vocalProcessor.setSlider(Math.max(0, Math.min(100, percent)) / 100f);
     }
 
-    @Override public int vocalState() { return mixer.state().ordinal(); }
-    @Override public boolean vocalReady() { return mixer.isReady(); }
-    @Override public long vocalProcessedFrames() { return mixer.processedFrames(); }
-    @Override public long vocalFallbackFrames() { return mixer.fallbackFrames(); }
+    @Override public int vocalState() {
+        if (!vocalEnabled) return 0;        // DISABLED
+        if (cacheReady) return 2;           // READY (seamless cache attached)
+        if (cachePreparing) return 1;       // WARMUP (offline pass running)
+        return 0;
+    }
+    @Override public boolean vocalReady() { return cacheReady; }
+    @Override public long vocalProcessedFrames() { return vocalProcessor.positionFrames(); }
+    @Override public long vocalFallbackFrames() { return 0L; }
 
     // ---- audio focus (main thread) ----------------------------------------
 
