@@ -52,6 +52,24 @@ public interface VocalSeparator extends AutoCloseable {
      */
     default boolean isPending() { return false; }
 
+    /**
+     * True when this separator performs the dry/vocal blend itself, using an
+     * internal time base that keeps the two aligned.
+     *
+     * <p>This matters: separation runs on a ~0.7 s STFT window, so the vocals it
+     * emits correspond to an EARLIER slice of the dry stream. A caller that blends
+     * them against the live dry block would subtract mis-aligned signals (the
+     * cancellation produces the original mix instead of vocals). Separators that
+     * mix internally report true and the caller must NOT blend again.
+     */
+    default boolean mixesInternally() { return false; }
+
+    /**
+     * Current slider position in [0,1] for separators that {@link #mixesInternally}.
+     * Cheap and thread-safe: implementations only store the value.
+     */
+    default void setSlider(float p) { }
+
     /** Drop buffered state on seek / track change. */
     void flush();
 

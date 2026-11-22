@@ -33,6 +33,8 @@ public final class TransposeNative implements VocalSeparator {
     private volatile boolean modelLoading;
     private volatile boolean pending;
     private volatile boolean inferenceFailed;
+    /** Slider in [0,1]; read once per block when blending inside native. */
+    private volatile float slider = 0.5f;
     private int diagCount;
 
     private final String modelPath;
@@ -54,6 +56,8 @@ public final class TransposeNative implements VocalSeparator {
     @Override public boolean isSupported() { return supported; }
     @Override public boolean isReady() { return modelHandle != 0L && stftHandle != 0L; }
     @Override public boolean isPending() { return pending; }
+    @Override public boolean mixesInternally() { return true; }
+    @Override public void setSlider(float p) { this.slider = VocalMixMath.clamp(p); }
 
     @Override public void prewarm() {
         if (!supported || modelHandle != 0L || modelLoading) return;
@@ -175,11 +179,32 @@ public final class TransposeNative implements VocalSeparator {
         boolean unpacked = VocalRemovalProcessor.unpackMdx(stftHandle, modelOut, istftReal, istftImag, frames, inChannels);
         logDiag("unpackMdx=" + unpacked);
         if (!unpacked) return false;
+
+        // Blend INSIDE native so the original and the model output share one time
+        // base. Doing it in Java against the live dry block would subtract
+        // mis-aligned signals and yield the original mix instead of vocals.
+        //
+        // native: mixed = orig*(1-mix) + target*mix, where
+        //   vocalOnly=false -> target = instrumental (orig - vocal)
+        //   vocalOnly=true  -> target = vocal
+        // so the two halves of the slider map onto the two target modes.
+        float p = VocalMixMath.clamp(slider);
+        final float mix;
+        final boolean vocalOnly;
+        if (p <= 0.5f) {
+            mix = 1f - 2f * p;      // p=0 -> 1 (pure instrumental), 0.5 -> 0 (original)
+            vocalOnly = false;
+        } else {
+            mix = 2f * p - 1f;      // p=1 -> 1 (pure vocals), 0.5 -> 0 (original)
+            vocalOnly = true;
+        }
+
         int got = VocalRemovalProcessor.computeIstftInterval(
                 stftHandle, istftReal, istftImag, dryChunk, intervalBytes, frames, inChannels,
                 EXTRACT_OFFSET, INTERVAL_SAMPLES, EXTRACT_OFFSET * bytesPerFrame,
-                1f, 1f, true, false, false);
-        logDiag("computeIstft got=" + got + " expect=" + INTERVAL_SAMPLES);
+                mix, 1f, true, false, vocalOnly);
+        logDiag("computeIstft got=" + got + " expect=" + INTERVAL_SAMPLES
+                + " p=" + p + " mix=" + mix + " vocalOnly=" + vocalOnly);
         return got == INTERVAL_SAMPLES;
     }
 

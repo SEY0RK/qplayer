@@ -84,10 +84,14 @@ public final class VocalMixingProcessor {
         }
     }
 
-    /** Slider position in [0,1]. Gain-only — never touches the separator. */
+    /**
+     * Slider position in [0,1]. Stored only — no flush(), no prewarm(), no state
+     * change. Forwarded to separators that blend internally so they can pick it up
+     * on their next block.
+     */
     public void setSlider(float p) {
         slider = VocalMixMath.clamp(p);
-        // Intentionally no flush(), no prewarm(), no state change.
+        separator.setSlider(slider);
     }
 
     /** Prepare the separator for a concrete PCM format. Called once by the host. */
@@ -163,6 +167,14 @@ public final class VocalMixingProcessor {
         }
 
         state = VocalProcessorState.PROCESSING;
+        if (separator.mixesInternally()) {
+            // The separator already blended dry+model on its own time base (the two
+            // are only aligned there). Adopting its output verbatim is correct;
+            // blending again here would mix against a live, mis-aligned dry block.
+            System.arraycopy(vocalScratch, 0, pcm, 0, n);
+            processedFrames.addAndGet(frames);
+            return;
+        }
         advanceRamp(frames, sampleRate);
         float dg = smoothDry;
         float vg = smoothVocal;
