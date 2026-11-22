@@ -38,8 +38,6 @@ public final class VocalDelayProcessor implements AudioProcessor {
     private static final int XFADE_FRAMES = 882;      // 20 ms @ 44.1 kHz
     /** Queue depth guard: 16 blocks ≈ 8.8 s of headroom against short excursions. */
     private static final int MAX_QUEUE = 16;
-    /** Applied at the top of queueInput (audio thread) to avoid cross-thread ring edits. */
-    private volatile long pendingSkipTo = -1;
 
     // ---- configuration ---------------------------------------------------
     private volatile int delayFrames = 66_150;        // 1.5 s @ 44.1 kHz, refined at runtime
@@ -121,22 +119,15 @@ public final class VocalDelayProcessor implements AudioProcessor {
                 setDelayMs(DEFAULT_DELAY_MS);
                 startCalibration();
             }
-        } else if (on) {
-            // Re-enabling while the delay is already running. History piled up in the
-            // engine unconsumed, so ask it to jump to the window that covers the
-            // CURRENT output cursor. Without this the catch-up runs 4+ inferences on
-            // the audio thread (~1.4 s) — the stall users hear when toggling back on.
-            long needBase = outputCursor - StreamingSeparator.EXTRACT_OFFSET
-                    - StreamingSeparator.INTERVAL_FRAMES / 2;
-            if (needBase > 0) pendingSkipTo = needBase;
-            Log.i(TAG, "re-enable: align engine to out=" + outputCursor
-                    + " skipTo=" + Math.max(0, needBase));
         }
+        // No re-alignment needed on either edge any more: the engine is drained even
+        // while separation is off, so the queue always already covers the output
+        // cursor and the blend simply ramps across (20 ms) with nothing to recompute.
         // No buffer flush either way. Dry history is kept, the separated queue is
-        // kept, and the blend simply ramps to the other side at the CURRENT cursor
-        // — which is what makes the toggle seamless in both directions.
+        // kept, and the blend ramps to the other side at the CURRENT cursor.
         Log.i(TAG, "enabled=" + on + " at outputCursor=" + outputCursor
-                + " blend=" + sepBlend + " engaged=" + engaged);
+                + " blend=" + sepBlend + " engaged=" + engaged
+                + " queue=" + queue.size());
     }
 
     /**
@@ -354,36 +345,23 @@ public final class VocalDelayProcessor implements AudioProcessor {
         // 2. Feed the separator and harvest finished blocks.
         StreamingSeparator eng = engine;
         if (eng != null && eng.isReady()) {
-            // Re-align before feeding: while separation was off, history piled up
-            // unconsumed, and draining it all here would run several inferences on the
-            // audio thread (audible stall). Jumping the base means one window suffices.
-            long skip = pendingSkipTo;
-            if (skip >= 0) {
-                eng.skipTo(skip);
-                pendingSkipTo = -1;
-            }
-            // Keep the ring current even while separation is OFF. On re-enable this
-            // history is what lets the queue catch up to the output cursor at once
-            // instead of re-priming for another full window — the difference between
-            // an instant toggle and a second of silence.
             eng.feed(work, 0, frames);
 
-            if (enabled) {
-                // Calibration runs on its own thread/engine (startCalibration) so the
-                // audio path never blocks here.
-                //
-                // Drain COMPLETELY, every block. Capping the count (an earlier attempt)
-                // made the engine fall permanently behind: any block that needed more
-                // than the cap left a residue, the residue grew, the input ring
-                // overran, positions developed holes and playback stuttered forever.
-                // Steady state only ever has one window ready, so this does not
-                // lengthen the average call — it just refuses to fall behind.
-                StreamingSeparator.Segment seg;
-                while ((seg = eng.poll()) != null) {
-                    if (seg.endFrame() <= outputCursor) continue;   // already played past
-                    while (queue.size() >= MAX_QUEUE) queue.pollFirst();
-                    queue.addLast(seg);
-                }
+            // Drain regardless of `enabled`.
+            //
+            // Stopping the drain while the switch is off looks like a saving, but it
+            // puts the engine 1.5 s behind the decoder (the delay). Re-enabling then
+            // has to recompute that whole span — two full windows, i.e. two ~354 ms
+            // stalls on the audio thread plus the buffer underrun between them. The
+            // only way a toggle can be truly instant is for the queue to already hold
+            // the block covering the output cursor, which means keeping the engine in
+            // lock-step while separation is off. The cost is CPU during that time; the
+            // cost of the alternative is an audible glitch on every toggle.
+            StreamingSeparator.Segment seg;
+            while ((seg = eng.poll()) != null) {
+                if (seg.endFrame() <= outputCursor) continue;   // already played past
+                while (queue.size() >= MAX_QUEUE) queue.pollFirst();
+                queue.addLast(seg);
             }
         }
 
