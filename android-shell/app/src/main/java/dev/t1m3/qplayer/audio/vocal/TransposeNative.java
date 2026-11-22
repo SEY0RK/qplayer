@@ -31,6 +31,7 @@ public final class TransposeNative implements VocalSeparator {
     private volatile long stftHandle;
     private volatile long modelHandle;
     private volatile boolean modelLoading;
+    private int diagCount;
 
     private final String modelPath;
     private int sampleRate = 44100;
@@ -96,6 +97,10 @@ public final class TransposeNative implements VocalSeparator {
         return ByteBuffer.allocateDirect(floats * 4).order(ByteOrder.nativeOrder());
     }
 
+    private void logDiag(String msg) {
+        if (diagCount++ < 30) android.util.Log.i("VocalDiag", msg);
+    }
+
     @Override
     public boolean separate(short[] dry, int dryOff, short[] vocals, int vocOff,
                             int frames, int channels) {
@@ -105,6 +110,9 @@ public final class TransposeNative implements VocalSeparator {
         inputRing.write(dryBytes, 0, dryBytes.length);
         produceIntervals();
         int wantBytes = need * 2;
+        if (diagCount < 30) logDiag("separate frames=" + frames + " wantBytes=" + wantBytes
+                + " vocalAvail=" + vocalAvail + " inputAvail=" + inputRing.available()
+                + " stft=" + stftHandle + " model=" + modelHandle);
         if (vocalAvail < wantBytes) return false;
         byte[] out = readBytes(wantBytes);
         for (int i = 0; i < need; i++) {
@@ -132,6 +140,7 @@ public final class TransposeNative implements VocalSeparator {
         pcmChunk.put(dryChunk, 0, CHUNK_SAMPLES * bytesPerFrame).flip();
         int frames = VocalRemovalProcessor.computeStft(
                 stftHandle, pcmChunk, CHUNK_SAMPLES, stftReal, stftImag, inChannels);
+        logDiag("computeStft frames=" + frames);
         if (frames <= 0) return false;
         if (inChannels == 1) {
             int stride = DIM_F * frames;
@@ -142,13 +151,20 @@ public final class TransposeNative implements VocalSeparator {
                 i.put(stride + k, i.get(k));
             }
         }
-        if (!VocalRemovalProcessor.packMdx(stftHandle, stftReal, stftImag, modelIn, frames)) return false;
-        if (!VocalRemovalProcessor.runMdx(modelHandle, modelIn, modelOut, frames)) return false;
-        if (!VocalRemovalProcessor.unpackMdx(stftHandle, modelOut, istftReal, istftImag, frames, inChannels)) return false;
+        boolean packed = VocalRemovalProcessor.packMdx(stftHandle, stftReal, stftImag, modelIn, frames);
+        logDiag("packMdx=" + packed);
+        if (!packed) return false;
+        boolean ran = VocalRemovalProcessor.runMdx(modelHandle, modelIn, modelOut, frames);
+        logDiag("runMdx=" + ran);
+        if (!ran) return false;
+        boolean unpacked = VocalRemovalProcessor.unpackMdx(stftHandle, modelOut, istftReal, istftImag, frames, inChannels);
+        logDiag("unpackMdx=" + unpacked);
+        if (!unpacked) return false;
         int got = VocalRemovalProcessor.computeIstftInterval(
                 stftHandle, istftReal, istftImag, dryChunk, intervalBytes, frames, inChannels,
                 EXTRACT_OFFSET, INTERVAL_SAMPLES, EXTRACT_OFFSET * bytesPerFrame,
                 1f, 1f, true, false, false);
+        logDiag("computeIstft got=" + got + " expect=" + INTERVAL_SAMPLES);
         return got == INTERVAL_SAMPLES;
     }
 
