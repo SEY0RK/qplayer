@@ -43,8 +43,11 @@ public final class VocalMixingProcessor {
     private final AtomicLong fallbackFrames = new AtomicLong();
 
     // Smoothed gains, advanced per processing block on the audio thread only.
+    // NOTE: smoothVocal multiplies the separator's INSTRUMENTAL track (see
+    // VocalMixMath.vocalGain) — the name is kept from the plan's vocabulary.
     private float smoothDry = 1f;
     private float smoothVocal = 0f;
+    // Holds the separator's instrumental output for the current block.
     private short[] vocalScratch = new short[0];
     private int channels = 2;
 

@@ -6,25 +6,21 @@ package dev.t1m3.qplayer.audio.vocal;
  * <p>Definitions:
  * <ul>
  *   <li>M = original mix (dry PCM)</li>
- *   <li>V = separated vocals</li>
- *   <li>I = separated instrumental = M - V (Transpose emits vocals only)</li>
+ *   <li>I = separated instrumental (what Transpose's native layer emits when
+ *       its {@code mixRatio} is 1 — its scale is 1 = instrumental, 0 = original)</li>
+ *   <li>V = vocals = M - I (derived here, not by the model)</li>
  *   <li>p = slider position in [0, 1]</li>
  * </ul>
  *
- * <p>Design formulas from the implementation plan:
+ * <p>We feed the separator a fixed {@code mixRatio = 1} (instrumental) and do all
+ * blending on int16 samples:
  * <pre>
- *   p &lt;= 0.5 :  Output = I + 2p * V
- *   p &gt;  0.5 :  Output = V + 2(1-p) * I
+ *   p &lt;= 0.5 :  Output = (1 - 2p) * I + 2p * M
+ *   p &gt;  0.5 :  Output = M + (1 - 2p) * I
  * </pre>
- * Substituting I = M - V gives a single affine form that is what we actually
- * evaluate on int16 samples:
- * <pre>
- *   Output = M + (2p - 1) * V          (p &lt;= 0.5)
- *   Output = (2 - 2p) * M + (2p - 1) * V   (p &gt; 0.5)
- * </pre>
- * Note the vocal coefficient is {@code 2p - 1} on BOTH sides — at p=0.5 it is
- * exactly 0, which is why the centre can be a true raw-PCM bypass with no
- * audible discontinuity.
+ * At p=0 this is pure instrumental, at p=0.5 pure original, at p=1 {@code M - I}
+ * (vocals). The instrumental coefficient is exactly 0 at the centre, which is why
+ * 50% can be a true raw-PCM bypass with no discontinuity.
  *
  * <p>No loudness compensation is applied, by design (plan section 2).
  */
@@ -52,12 +48,25 @@ public final class VocalMixMath {
     /** Coefficient applied to the original mix M. */
     public static float dryGain(float p) {
         float x = clamp(p);
-        return x <= CENTRE ? 1f : 2f * (1f - x);
+        return x <= CENTRE ? 2f * x : 1f;
     }
 
-    /** Coefficient applied to the separated vocals V. */
+    /**
+     * Coefficient applied to the separator's instrumental track (I).
+     *
+     * <p>IMPORTANT: the value we mix here is the INSTRUMENTAL, not the vocals.
+     * Transpose's native mixRatio uses 1 = instrumental (see its
+     * {@code mixed = orig*(1-mix) + instrumental*mix}), so we ask it for the
+     * instrumental and derive vocals as {@code M - I} ourselves.
+     *
+     * <pre>
+     *   p = 0.0  ->  I                  (pure instrumental)
+     *   p = 0.5  ->  M                  (original, exact passthrough)
+     *   p = 1.0  ->  M - I              (vocals only)
+     * </pre>
+     */
     public static float vocalGain(float p) {
-        return 2f * clamp(p) - 1f;
+        return 1f - 2f * clamp(p);
     }
 
     /**
