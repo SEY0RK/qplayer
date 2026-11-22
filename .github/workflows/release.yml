@@ -135,6 +135,28 @@ jobs:
       - name: Set up Windows C++ toolchain
         uses: ilammy/msvc-dev-cmd@v1
         with: { arch: x64 }
+      # --- vocal separation native (x64) -------------------------------------
+      # Fetches Transpose's JNI source and pins ONNX Runtime 1.21.x (the upstream
+      # header declares ORT_API_VERSION 21). Android-only includes are satisfied by
+      # desktop-host/native/compat, so the upstream .cpp stays unpatched.
+      - name: Fetch vocal native assets + ONNX Runtime x64
+        run: python .github/scripts/prepare-vocal-windows.py
+      - name: Build vocal_removal_native.dll
+        shell: pwsh
+        run: |
+          cmake -S desktop-host/native -B desktop-host/native/build -G Ninja `
+                -DCMAKE_BUILD_TYPE=Release `
+                -DORT_DIR="$env:GITHUB_WORKSPACE/desktop-host/native/ort"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build desktop-host/native/build
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+          Get-ChildItem desktop-host/native/build -Filter *.dll |
+            Select-Object Name, Length | Format-Table -AutoSize
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QPlayer-vocal-native-win-x64
+          path: desktop-host/native/build/*.dll
+          if-no-files-found: error
       - name: Install WebView2 build SDK
         shell: pwsh
         run: |
