@@ -145,41 +145,9 @@ public final class StreamingSeparator {
         int chunkSamples = CHUNK_FRAMES * channels;
         if (inSize < chunkSamples) return null;
 
-        // Copy the window out of the ring (contiguous order).
-        int si = inRead;
-        for (int i = 0; i < chunkSamples; i++) {
-            short v = inRing[si];
-            si = (si + 1) % inRing.length;
-            dryChunk[i * 2] = (byte) (v & 0xFF);
-            dryChunk[i * 2 + 1] = (byte) ((v >> 8) & 0xFF);
-        }
-
         long startNanos = System.nanoTime();
-        pcmChunk.clear();
-        pcmChunk.put(dryChunk, 0, CHUNK_FRAMES * bytesPerFrame).flip();
-
-        int frames = VocalRemovalProcessor.computeStft(
-                stftHandle, pcmChunk, CHUNK_FRAMES, stftReal, stftImag, channels);
-        if (frames <= 0) { Log.w(TAG, "stft " + frames); return null; }
-        if (!VocalRemovalProcessor.packMdx(stftHandle, stftReal, stftImag, modelIn, frames)) {
-            Log.w(TAG, "pack failed"); return null;
-        }
-        if (!VocalRemovalProcessor.runMdx(modelHandle, modelIn, modelOut, frames)) {
-            Log.w(TAG, "run failed"); return null;
-        }
-        if (!VocalRemovalProcessor.unpackMdx(
-                stftHandle, modelOut, istftReal, istftImag, frames, channels)) {
-            Log.w(TAG, "unpack failed"); return null;
-        }
-
-        // Ask for the pure vocal side; the playback layer derives the mix so it can
-        // cross-fade against dry without another pass through native.
-        int got = VocalRemovalProcessor.computeIstftInterval(
-                stftHandle, istftReal, istftImag, dryChunk, intervalBytes, frames, channels,
-                EXTRACT_OFFSET, INTERVAL_FRAMES, EXTRACT_OFFSET * bytesPerFrame,
-                1f, 1f, true, false, true);
+        if (!runWindow()) return null;
         long elapsed = System.nanoTime() - startNanos;
-        if (got != INTERVAL_FRAMES) { Log.w(TAG, "istft " + got); return null; }
 
         long segStart = inBaseFrame + EXTRACT_OFFSET;
         // Consume one interval worth of input (overlap is retained by design).
@@ -206,6 +174,74 @@ public final class StreamingSeparator {
                 + " avgMs=" + (totalInferenceNanos / blocksProduced / 1_000_000)
                 + " maxMs=" + (maxInferenceNanos / 1_000_000));
         return new Segment(segStart, INTERVAL_FRAMES, out);
+    }
+
+    // ---- calibration ------------------------------------------------------
+
+    /** True when a full window is buffered and can be measured. */
+    public boolean canCalibrate() {
+        return isReady() && inSize >= CHUNK_FRAMES * channels;
+    }
+
+    /**
+     * Run one full separation pass over the CURRENT window without consuming it,
+     * and return the elapsed nanoseconds (or -1 on failure).
+     *
+     * <p>Used to size the playback delay per device: the algorithmic window is a
+     * fixed 859 ms, but inference cost varies several-fold across SoCs, so the
+     * delay must be measured rather than guessed.
+     */
+    public long calibrateOnce() {
+        if (!canCalibrate()) return -1L;
+        long t0 = System.nanoTime();
+        boolean ok = runWindow();
+        long dt = System.nanoTime() - t0;
+        Log.i(TAG, "CALIB " + (dt / 1_000_000) + "ms ok=" + ok);
+        return ok ? dt : -1L;
+    }
+
+    // ---- internals --------------------------------------------------------
+
+    /**
+     * Copy the window at {@code inRead} into {@code dryChunk} and run one full
+     * STFT -> MDX -> ISTFT pass, leaving the result in {@code intervalBytes}.
+     * Does NOT advance the ring cursor.
+     */
+    private boolean runWindow() {
+        int chunkSamples = CHUNK_FRAMES * channels;
+        int si = inRead;
+        for (int i = 0; i < chunkSamples; i++) {
+            short v = inRing[si];
+            si = (si + 1) % inRing.length;
+            dryChunk[i * 2] = (byte) (v & 0xFF);
+            dryChunk[i * 2 + 1] = (byte) ((v >> 8) & 0xFF);
+        }
+
+        pcmChunk.clear();
+        pcmChunk.put(dryChunk, 0, CHUNK_FRAMES * bytesPerFrame).flip();
+
+        int frames = VocalRemovalProcessor.computeStft(
+                stftHandle, pcmChunk, CHUNK_FRAMES, stftReal, stftImag, channels);
+        if (frames <= 0) { Log.w(TAG, "stft " + frames); return false; }
+        if (!VocalRemovalProcessor.packMdx(stftHandle, stftReal, stftImag, modelIn, frames)) {
+            Log.w(TAG, "pack failed"); return false;
+        }
+        if (!VocalRemovalProcessor.runMdx(modelHandle, modelIn, modelOut, frames)) {
+            Log.w(TAG, "run failed"); return false;
+        }
+        if (!VocalRemovalProcessor.unpackMdx(
+                stftHandle, modelOut, istftReal, istftImag, frames, channels)) {
+            Log.w(TAG, "unpack failed"); return false;
+        }
+
+        // Pure vocal side; the playback layer derives the mix so it can cross-fade
+        // against dry without another pass through native.
+        int got = VocalRemovalProcessor.computeIstftInterval(
+                stftHandle, istftReal, istftImag, dryChunk, intervalBytes, frames, channels,
+                EXTRACT_OFFSET, INTERVAL_FRAMES, EXTRACT_OFFSET * bytesPerFrame,
+                1f, 1f, true, false, true);
+        if (got != INTERVAL_FRAMES) { Log.w(TAG, "istft " + got); return false; }
+        return true;
     }
 
     /** Real-time factor of the last block (1.0 = exactly real time). */

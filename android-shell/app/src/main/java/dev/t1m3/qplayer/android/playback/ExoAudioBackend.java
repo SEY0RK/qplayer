@@ -53,6 +53,8 @@ import java.util.Map;
 public final class ExoAudioBackend implements AudioBackend {
 
     private static final long POSITION_POLL_MS = 50L;
+    /** Versioned so a model/algorithm change invalidates a stale calibration. */
+    private static final String KEY_DELAY_MS = "delay_ms_v1";
 
     private final Context appContext;
     private final AudioManager audioManager;
@@ -138,6 +140,21 @@ public final class ExoAudioBackend implements AudioBackend {
         File model = new File(appContext.getFilesDir(), "vocal/vocal_separation_core.bin");
         copyModelFromAssets(model);
         this.vocalProcessor = new VocalDelayProcessor(model.getAbsolutePath());
+
+        // Delay is device-dependent (inference cost varies several-fold across SoCs):
+        // reuse this device's measurement when we have one, otherwise measure once on
+        // first use and persist it. The key carries a version so a model swap
+        // invalidates stale numbers.
+        final android.content.SharedPreferences prefs =
+                appContext.getSharedPreferences("vocal", Context.MODE_PRIVATE);
+        int saved = prefs.getInt(KEY_DELAY_MS, 0);
+        if (saved > 0) {
+            vocalProcessor.setPresetDelayMs(saved);
+            Logger.info("vocal: reusing calibrated delay {}ms", saved);
+        }
+        vocalProcessor.setOnCalibrated(ms ->
+                prefs.edit().putInt(KEY_DELAY_MS, ms).apply());
+
         mainHandler.postDelayed(positionPoll, POSITION_POLL_MS);
     }
 
