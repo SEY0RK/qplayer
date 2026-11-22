@@ -132,10 +132,8 @@ public final class ExoAudioBackend implements AudioBackend {
         player = exo;
 
         DefaultHttpDataSource.Factory http = new DefaultHttpDataSource.Factory()
-                .setAllowCrossProtocolRedirects(true);
-        for (Map.Entry<String, String> e : sourceHeaders.entrySet()) {
-            http.setDefaultRequestProperty(e.getKey(), e.getValue());
-        }
+                .setAllowCrossProtocolRedirects(true)
+                .setDefaultRequestProperties(sourceHeaders);
         DefaultDataSource.Factory ds = new DefaultDataSource.Factory(appContext, http);
         MediaSource ms = new ProgressiveMediaSource.Factory(ds)
                 .createMediaSource(MediaItem.fromUri(src));
